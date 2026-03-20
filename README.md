@@ -31,6 +31,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [PHASE_2_3_FINAL_DECISIONS](dawn/archive/PHASE_2_3_FINAL_DECISIONS.md) | Final implementation decisions — architecture review 9.0/10 |
 | [AEC_DELAY_CALIBRATION](dawn/archive/AEC_DELAY_CALIBRATION.md) | Auto-calibrate AEC delay using TTS boot greeting |
 | [AEC_IMPLEMENTATION_STATUS](dawn/archive/AEC_IMPLEMENTATION_STATUS.md) | Native 48kHz AEC with WebRTC AEC3 — working state |
+| [AEC_IMPLEMENTATION_GUIDE](dawn/archive/AEC_IMPLEMENTATION_GUIDE.md) | WebRTC AEC3 setup, resampling strategy, tuning parameters |
 
 ### LLM Integration
 
@@ -72,3 +73,5 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | Document | Description |
 |----------|-------------|
 | [SCHEDULER_DESIGN](dawn/archive/SCHEDULER_DESIGN.md) | Timers, alarms, reminders, scheduled tasks — fully implemented |
+| [CALDAV_DESIGN](dawn/archive/CALDAV_DESIGN.md) | CalDAV calendar integration (multi-account, RFC 4791, Google OAuth, RRULE) |
+| [EMAIL_DESIGN](dawn/archive/EMAIL_DESIGN.md) | Email integration (IMAP/SMTP, Gmail REST API, multi-account, 10 LLM actions) |
