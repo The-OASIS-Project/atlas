@@ -75,3 +75,5 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [SCHEDULER_DESIGN](dawn/archive/SCHEDULER_DESIGN.md) | Timers, alarms, reminders, scheduled tasks — fully implemented |
 | [CALDAV_DESIGN](dawn/archive/CALDAV_DESIGN.md) | CalDAV calendar integration (multi-account, RFC 4791, Google OAuth, RRULE) |
 | [EMAIL_DESIGN](dawn/archive/EMAIL_DESIGN.md) | Email integration (IMAP/SMTP, Gmail REST API, multi-account, 10 LLM actions) |
+| [TWO_STEP_TOOL_PATTERN](dawn/archive/TWO_STEP_TOOL_PATTERN.md) | Two-step tool pattern: load guidelines then execute (used by render_visual) |
+| [VISUAL_RENDERING_TOOL](dawn/archive/VISUAL_RENDERING_TOOL.md) | Visual rendering tool: inline SVG/HTML diagrams via LLM tool calling, progress indicator investigation |
