@@ -59,6 +59,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [WEBUI_IMAGE_STORAGE_DESIGN](dawn/archive/WEBUI_IMAGE_STORAGE_DESIGN.md) | Image storage strategy (replacing inline base64) |
 | [CONVERSATION_HISTORY_DESIGN](dawn/archive/CONVERSATION_HISTORY_DESIGN.md) | Per-user conversation history UI |
 | [CONVERSATION_EXPORT_DESIGN](dawn/archive/CONVERSATION_EXPORT_DESIGN.md) | JSON conversation export |
+| [WEBUI_ALWAYS_ON_PLAN](dawn/archive/WEBUI_ALWAYS_ON_PLAN.md) | Always-on continuous voice listening (server-side VAD, wake word, unified action button) |
 
 ### Satellite and Protocol
 
