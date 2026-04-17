@@ -14,6 +14,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 |----------|-------------|
 | [MULTI_THREADED_CORE_DESIGN](dawn/archive/MULTI_THREADED_CORE_DESIGN.md) | Multi-threaded core: session manager, worker pool, per-session history, metrics |
 | [UNIFIED_COMMAND_PLAN](dawn/archive/UNIFIED_COMMAND_PLAN.md) | Unified command registry replacing fragmented callback system |
+| [UNIFIED_LOGGING_DESIGN](dawn/archive/UNIFIED_LOGGING_DESIGN.md) | Canonical logging.h/logging.c shared byte-identically across DAWN, ECHO, MIRAGE, and STAT (OLOG_* namespace, syslog + console suppression + ms timestamps, copy-based sync) |
 | [CONFIG_FILE_DESIGN](dawn/archive/CONFIG_FILE_DESIGN.md) | Full TOML configuration schema (dawn.toml, secrets.toml) |
 | [CONFIG_SYSTEM_PLAN](dawn/archive/CONFIG_SYSTEM_PLAN.md) | Config system core infrastructure (Phase 1) |
 | [PERFORMANCE_ANALYSIS](dawn/archive/PERFORMANCE_ANALYSIS.md) | Benchmark data vs industry (ASR latency, LLM throughput, end-to-end) |
