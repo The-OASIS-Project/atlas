@@ -18,6 +18,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [CONFIG_SYSTEM_PLAN](dawn/archive/CONFIG_SYSTEM_PLAN.md) | Config system core infrastructure (Phase 1) |
 | [PERFORMANCE_ANALYSIS](dawn/archive/PERFORMANCE_ANALYSIS.md) | Benchmark data vs industry (ASR latency, LLM throughput, end-to-end) |
 | [SECURITY_AUDIT](dawn/archive/SECURITY_AUDIT.md) | Static code audit: 15 findings across ~58K LOC (Dec 2025) |
+| [USER_AUTH_DESIGN](dawn/archive/USER_AUTH_DESIGN.md) | User authentication: deployment modes, dawn-admin CLI, setup wizard, multi-user, RBAC, session mgmt, audit log, IP rate limit, DAP2 registration key (Phases 0–4) |
 | [TUI_IMPLEMENTATION_PLAN](dawn/archive/TUI_IMPLEMENTATION_PLAN.md) | Console TUI for real-time monitoring and statistics |
 
 ### Speech and Audio
@@ -69,11 +70,20 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [PLEX_INTEGRATION_DESIGN](dawn/archive/PLEX_INTEGRATION_DESIGN.md) | Plex Media Server music streaming integration |
 | [SMARTTHINGS](dawn/archive/SMARTTHINGS.md) | SmartThings OAuth integration (blocked at AWS WAF) |
 
+### Memory and RAG
+
+| Document | Description |
+|----------|-------------|
+| [MEMORY_SYSTEM_DESIGN](dawn/archive/MEMORY_SYSTEM_DESIGN.md) | Persistent memory: entity graph, relations, facts, semantic embeddings, hybrid search, contacts, entity merge, retrieval benchmarking (Phases 1–6.7 + S4 + 13) |
+| [RAG_DESIGN](dawn/archive/RAG_DESIGN.md) | Document search / RAG: chunking, embeddings, hybrid semantic+keyword search, WebUI Document Library, admin management, `document_index` URL tool |
+
 ### Scheduler and Tools
 
 | Document | Description |
 |----------|-------------|
 | [SCHEDULER_DESIGN](dawn/archive/SCHEDULER_DESIGN.md) | Timers, alarms, reminders, scheduled tasks — fully implemented |
+| [TOOL_PLAN_EXECUTOR_DESIGN](dawn/archive/TOOL_PLAN_EXECUTOR_DESIGN.md) | Plan executor DSL: multi-step tool orchestration, conditionals, loops, variable binding, safety controls, sleep step |
+| [WEB_IMAGE_SEARCH](dawn/archive/WEB_IMAGE_SEARCH.md) | Image search tool: SearXNG, curl_multi concurrent fetch, SSRF DNS pinning, magic byte validation, LRU cache, WebUI lightbox |
 | [CALDAV_DESIGN](dawn/archive/CALDAV_DESIGN.md) | CalDAV calendar integration (multi-account, RFC 4791, Google OAuth, RRULE) |
 | [EMAIL_DESIGN](dawn/archive/EMAIL_DESIGN.md) | Email integration (IMAP/SMTP, Gmail REST API, multi-account, 10 LLM actions) |
 | [TWO_STEP_TOOL_PATTERN](dawn/archive/TWO_STEP_TOOL_PATTERN.md) | Two-step tool pattern: load guidelines then execute (used by render_visual) |
