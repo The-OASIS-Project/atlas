@@ -76,6 +76,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | Document | Description |
 |----------|-------------|
 | [MEMORY_SYSTEM_DESIGN](dawn/archive/MEMORY_SYSTEM_DESIGN.md) | Persistent memory: entity graph, relations, facts, semantic embeddings, hybrid search, contacts, entity merge, retrieval benchmarking (Phases 1–6.7 + S4 + 13) |
+| [MEMORY_INJECTION_FILTER](dawn/archive/MEMORY_INJECTION_FILTER.md) | Memory injection filter: shared blocklist module with Unicode normalization (homoglyphs, accents, fullwidth, invisible chars), ~118 patterns across 17 categories, data-marking framing, all-path coverage (tool/extraction/import), 137 unit tests |
 | [RAG_DESIGN](dawn/archive/RAG_DESIGN.md) | Document search / RAG: chunking, embeddings, hybrid semantic+keyword search, WebUI Document Library, admin management, `document_index` URL tool |
 
 ### Scheduler and Tools
