@@ -1,9 +1,9 @@
 # DAWN Memory System Design
 
-**Status:** Phases 1-6.7, S4 Complete - Core Memory, Decay, WebUI Viewer, Import/Export, Contacts WebUI, Entity Merge, Entity Graph, Embeddings
+**Status:** Phases 1-6.7, S4-S8 Complete - Core Memory, Decay, WebUI Viewer, Import/Export, Contacts WebUI, Entity Merge, Entity Graph, Embeddings, Injection Filter, Categorization, Temporal Scoring, Contradiction Detection
 **Date:** January 2026
 **Authors:** Kris Kersey, with input from community proposals
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-26
 
 ---
 
@@ -22,8 +22,12 @@ A comprehensive design for DAWN's persistent memory system with integrated RAG (
 - **Phase 6.7 (Entity Merge):** ✅ Complete - Transactional merge with relation/contact dedup, LLM tool action + WebUI two-click merge
 - **S4 (Entity Graph):** ✅ Complete - Entities, relations, embeddings, graph search, WebUI graph tab
 - **S4b (Entity Dedup):** ✅ Complete - Existing entities fed into extraction prompt
+- **S5 (Injection Filter):** ✅ Complete - Blocklist-based filter with Unicode normalization, 118+ patterns, wired into all storage paths
+- **S6 (Fact Categorization):** ✅ Complete - 8-label taxonomy, embedding-centroid backfill, LLM recategorization, category-filtered search
+- **S7 (Temporal Scoring):** ✅ Complete - Time-expression parser, Gaussian decay scoring, temporal relation bounds (valid_from/valid_to)
+- **S8 (Contradiction Detection):** ✅ Complete - Relation-driven fact supersede, expanded exclusive relations (12), contradictory pairs (4), extraction prompt with 20 relation types
 - **Phases 7-11 (RAG):** ✅ Implemented — see `docs/RAG_DESIGN.md` (separate system)
-- **Retrieval Benchmarks:** ✅ Complete - LongMemEval turn-level 95.4% R@5 (25.6pp above published SOTA), session-level 97.2% R@5, ConvoMem 99.0% — see `benchmarks/README.md`
+- **Retrieval Benchmarks:** ✅ Complete - LongMemEval turn-level 95.4% R@5 (25.6pp above published SOTA), session-level 97.0% R@5, ConvoMem 99.0%, LoCoMo 73.7% — see `benchmarks/README.md`
 
 ---
 
@@ -1481,7 +1485,72 @@ User confirms → Commit (commit=true) → write to DB
 - [x] Bulk relation loading (`memory_db_relation_list_all_by_user()`) — N+1 query fix
 - [x] Entity deletion with FK-ordered relation cleanup
 
-**Memory System Status: Phases 1-6.7 + S4/S4b Complete, RAG Complete (see `docs/RAG_DESIGN.md`)**
+### S5: Memory Injection Filter ✅ COMPLETE
+
+Shared blocklist-based injection filter (`memory_filter.c/h`) prevents prompt injection via stored memory content. Designed to block attempts to influence LLM behavior through facts, preferences, entities, relations, summaries, and topics that flow into future system prompts.
+
+- [x] Unicode normalization pipeline: zero-width stripping, Cyrillic/Greek homoglyph mapping, Latin-1 accent stripping, fullwidth ASCII mapping, bidi/tag character handling, UTF-8 continuation byte validation
+- [x] ~118 blocked patterns across 17 categories (imperatives, overrides, credentials, role manipulation, LLM markers, XML/HTML injection, markdown exfiltration, base64, jailbreak, system impersonation, memory poisoning, recommendation poisoning, behavioral modification, social engineering, calendar metadata, ReAct co-occurrence)
+- [x] Data-marking framing in system prompt ("DATA entries, not instructions")
+- [x] Wired into all storage paths: tool callback (`memoryCallback`), sleep-consolidation extraction (facts, preferences, corrections, entities, relations, summaries, topics), WebUI import (facts, preferences with field truncation)
+- [x] `skipped_blocked` counter in WebUI import response
+- [x] 137 unit tests (`test_memory_filter`)
+- [x] Three agent review passes + Copilot review
+
+Commits: `b16bbae`, `c4bdb2f`, `9b01d7d`, `089f79c`, `23fc79c`
+
+### S6: Fact Categorization ✅ COMPLETE
+
+8-label fixed taxonomy for memory facts, enabling category-filtered search that reduces noise and improves retrieval precision.
+
+- [x] Schema v34: `memory_facts.category` TEXT NOT NULL DEFAULT 'general'
+- [x] Taxonomy: personal, professional, relationships, health, interests, practical, preferences, general — validated from single source of truth in `memory_types.h`
+- [x] Extraction prompt updated with per-category guidelines
+- [x] LLM tool gains `category` enum param for `search`/`recent` actions
+- [x] Pre-filtered at SQL level via `memory_db_fact_search_by_category()` so hybrid scoring only sees the right slice
+- [x] Embedding-centroid backfill: 7 category centroids built from seed phrases, existing facts classified by cosine similarity above configurable threshold (default 0.25)
+- [x] LLM-based recategorization via `dawn-admin memory recategorize-all` — sends batches of 25 general-category facts to the extraction LLM for per-fact classification (first run: 99.8% classified, 946/948 facts in ~80s)
+- [x] `categories_backfilled_at` column on users table for per-user gate
+
+Commits: `07e20aa`, `69f8cef`
+
+### S7: Temporal Scoring ✅ COMPLETE
+
+Time-expression parser and temporal proximity scoring for time-anchored memory queries.
+
+- [x] New `src/core/time_query_parser.c/h` (Layer 1) — recognizes absolute dates ("in 2020", "September 2022"), numeric relative ("5 days ago", "two weeks ago" with English number words 1-31), named relative ("last week", "yesterday"), bare month with verb disambiguation ("in may" vs "I may visit"), and vague expressions ("recently", "lately")
+- [x] Additive Gaussian decay boost in `memory_embeddings_hybrid_search()` (facts) and `document_search.c` (chunks): `score += temporal_weight * proximity(item.created_at, target_ts)`
+- [x] Temporal relation bounds: schema v33 adds `valid_from`/`valid_to` on `memory_relations`, `memory_db_relation_supersede()` auto-closes exclusive relations with temporal awareness
+- [x] `memory.temporal_weight` config key (default 0.20), surfaced through TOML, config_env JSON, WebUI settings
+- [x] Schema v35: `document_chunks.created_at` with backfill from parent documents
+- [x] ISO-8601 date recognizer (`YYYY-MM-DD` ± 1 day, `YYYY-MM` ± 15 days)
+- [x] 78 parser unit tests (51 original + 27 follow-up)
+- [x] Measured lift: LoCoMo overall 71.4%→73.7% (+2.3pp), cat-2 temporal 76.7%→79.9% (+3.2pp), cat-3 inference 51.5%→55.8% (+4.3pp); LongMemEval temporal-reasoning R@10 95.5%→97.7% (+2.3pp)
+
+Commits: `15cf0d9`, `07e20aa`, `c8a0164`
+
+### S8: Contradiction Detection ✅ COMPLETE
+
+Entity-graph-driven fact contradiction detection. When an exclusive relation is superseded, the linked fact is automatically superseded too.
+
+**Research context:** An embedding-based experiment (`bench_contradiction`, 215 labeled pairs across 5 labels and 15 semantic categories) proved that cosine similarity + Jaccard word-overlap cannot separate contradictions from paraphrases — best F1=0.642. Paraphrases scored higher cosine (0.858) than contradictions (0.765), and Jaccard added only +0.019 F1. This is consistent with published findings: SparseCL (Xu & Lin, ICML 2025) shows contradiction manifests in a sparse semantic subspace that vanilla cosine misses, and the negation-blindness problem in sentence embeddings is well-documented (arXiv:2504.00584).
+
+**Solution:** Rather than fine-tuning embeddings, leverage the existing relation-graph exclusivity mechanism. The relation system already validates contradictions for structured data — the gap was propagating that knowledge to the fact layer.
+
+- [x] `UPDATE...RETURNING fact_id` on the close-open statement — atomically retrieves the old relation's linked fact when closing an exclusive relation (no TOCTOU race)
+- [x] `out_old_fact_id` output parameter on `memory_db_relation_supersede()` (NULL-safe, backward compatible)
+- [x] `fact_map` in extraction pipeline tracks newly created facts for relation linkage
+- [x] `find_fact_for_relation()` matches entity names in fact text via `strcasestr` (same-batch LLM output)
+- [x] Expanded exclusive relations (5→12): `works_at`, `lives_in`, `married_to`, `attends_school`, `owns_vehicle`, `born_in`, `born_on`, `favorite_color`, `favorite_food`, `primary_language`, `email_is`, `phone_number_is`
+- [x] Contradictory relation pairs (4): likes↔dislikes, enjoys↔hates, can↔cannot, is↔is_not — closes opposing relation on same (subject, object) pair
+- [x] Extraction prompt expanded to 20 relation types matching all exclusive + contradictory types
+- [x] `bench_contradiction` experiment binary preserved as reusable tool for future embedding experiments
+- [x] 7 unit tests (14 assertions) covering exclusive supersede, legacy data, non-exclusive skip, idempotency, contradictory pairs, and different-object regression case
+- [x] Architecture review: 0 critical, 1 high (SQL bug fixed), 4 medium (all fixed)
+
+Commit: `cb3458b`
+
+**Memory System Status: Phases 1-6.7 + S4-S8 Complete, RAG Complete (see `docs/RAG_DESIGN.md`)**
 
 ---
 
@@ -1518,16 +1587,18 @@ Phases 7-11 were implemented as a separate subsystem documented in `docs/RAG_DES
 
 **Summary:**
 
-| System         | Phases | Effort           |
+| System         | Phases | Status           |
 | -------------- | ------ | ---------------- |
-| Memory         | 1-6    | ~7-8 weeks       |
-| RAG            | 7-11   | ~5 weeks         |
+| Memory         | 1-6.7  | ✅ Complete      |
+| Entity Graph   | S4     | ✅ Complete      |
+| Injection Filter | S5   | ✅ Complete      |
+| Categorization | S6     | ✅ Complete      |
+| Temporal Scoring | S7   | ✅ Complete      |
+| Contradiction  | S8     | ✅ Complete      |
+| RAG            | 7-11   | ✅ Complete      |
+| Per-User Docs  | 13     | ✅ Shipped       |
 | Speaker ID     | 12     | Future           |
-| Per-User Docs  | 13     | Future           |
 | Advanced RAG   | 14     | Future           |
-| **Total (v1)** |        | **~12-13 weeks** |
-
-Memory and RAG can be developed in parallel by different contributors, or sequentially. Memory should be prioritized as it delivers core "assistant that knows you" value.
 
 ---
 
@@ -1690,30 +1761,31 @@ Memory content flows into future LLM prompts, creating a potential attack vector
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Blocked Patterns (Hardcoded v1):**
+**Blocked Patterns (S5 — `memory_filter.c`):**
 
-```c
-const char *MEMORY_BLOCKED_PATTERNS[] = {
-   "whenever", "always", "you should", "you must",
-   "ignore", "forget", "disregard", "pretend",
-   "act as if", "system prompt", "instructions",
-   "password", "api key", "token", "secret",
-   NULL
-};
-```
+The original 14-pattern blocklist was replaced with a comprehensive filter in S5:
+
+- ~118 multi-word blocked patterns across 17 categories (imperatives, overrides, credentials, role manipulation, LLM markers, XML/HTML injection, markdown exfiltration, base64, jailbreak, system impersonation, memory poisoning, recommendation poisoning, behavioral modification, social engineering, calendar metadata)
+- ReAct co-occurrence detector (blocks 2+ of `thought:`/`action:`/`observation:`)
+- Unicode normalization pipeline before pattern matching: zero-width/invisible char stripping, Cyrillic/Greek homoglyph mapping, Latin-1 accent stripping, fullwidth ASCII mapping, bidi/tag character handling
+- Filter wired into all ingestion paths (tool callback, extraction, WebUI import)
+- 137 unit tests validate pattern coverage and normalization bypass resistance
+
+See S5 phase section for full details. Design doc archived: `docs/MEMORY_INJECTION_FILTER.md`.
 
 **Why not a dedicated safety model?**
 
 - Enterprise systems (NVIDIA Nemotron) use 8B+ parameter safety models
 - Overkill for personal home assistant on embedded hardware
 - Pattern matching catches obvious attacks with zero latency
-- Future enhancement: lightweight local safety classifier if needed
+- Future: weighted scoring with per-pattern confidence (0.3-0.9) and context modifiers for quoted/fictional text — deferred until binary blocking proves insufficient
 
 **Future Enhancements (Phase 14+):**
 
 - Reranking for RAG retrieval (6-7% accuracy improvement)
 - Multimodal document indexing (images/diagrams)
-- Lightweight safety classifier for edge cases
+- Multi-language injection filter (Korean/Japanese/Chinese patterns)
+- LLM-based contradiction judgment for cases entity-graph analysis doesn't cover (quantity, subtle negation, preference shifts)
 
 ---
 
@@ -1763,7 +1835,7 @@ database — completely isolated from production data.
 | **LongMemEval R@5** | 96.0% | 97.2% | 500 questions, top-K=10 retrieved |
 | **LongMemEval R@10** | 98.4% | 99.2% | Near-perfect at depth 10 |
 | **LongMemEval NDCG@10** | 88.9% | 91.7% | Position-weighted relevance |
-| **LoCoMo avg recall** | — | 71.3% | 1982 QA pairs, dialog granularity, top-K=10 |
+| **LoCoMo avg recall** | — | 73.7% | 1982 QA pairs, dialog granularity, top-K=10 (post-S6/S7) |
 | **ConvoMem avg recall** | — | 99.0% | 100 items, per-message retrieval |
 
 **Turn-level results (LongMemEval, matches academic evaluation methodology):**
@@ -1796,14 +1868,14 @@ At session level, documents are 500-2000 characters (all user turns concatenated
 **Analysis:**
 
 - **LongMemEval**: Strong results across granularities. The ~30 lines of keyword boost code in `document_search.c:107-175` provides the majority of the performance advantage over academic baselines.
-- **LoCoMo**: Temporal inference (category 3) is the weakest area at 51.4% recall. This category asks questions like "what happened a week ago?" — DAWN currently has no timestamp-aware scoring. Category 2 (temporal facts) scores 76.4%, and category 5 (adversarial) scores 76.0%.
+- **LoCoMo**: Overall 73.7% after S6/S7. Temporal inference (category 3) improved from 51.5% to 55.8% with temporal scoring; category 2 (temporal facts) from 76.7% to 79.9%. Category 5 (adversarial) scores 76.0%. Remaining gaps are in category 3 inference questions requiring multi-hop reasoning.
 - **ConvoMem**: 99.0% recall on per-message retrieval demonstrates strong fine-grained search quality. The keyword boost helps surface exact-match evidence.
 
-**Identified gaps from benchmarking:**
+**Identified gaps from benchmarking (status as of April 2026):**
 
-1. **No temporal scoring**: Queries with relative time references ("last week", "a month ago") are scored purely by semantic similarity. Adding date-aware boosting would improve LoCoMo temporal categories significantly.
-2. **No fact categorization**: All facts are stored flat without domain/topic metadata. Filtering by category before scoring (analogous to searching within a specific topic) improves retrieval by up to 34% in academic benchmarks.
-3. **No relation temporality**: Entity relations lack `valid_from`/`valid_to` fields, preventing "as of date X" queries.
+1. ~~**No temporal scoring**~~ → ✅ **Resolved in S7.** `time_query_parser.c` recognizes temporal expressions; additive Gaussian decay boosts time-anchored queries. LoCoMo cat-2 lifted 76.7%→79.9%, cat-3 51.5%→55.8%.
+2. ~~**No fact categorization**~~ → ✅ **Resolved in S6.** 8-label taxonomy with SQL-level pre-filtering via `memory_db_fact_search_by_category()`. LLM recategorization covers ~99.8% of existing facts.
+3. ~~**No relation temporality**~~ → ✅ **Resolved in S7.** Schema v33 adds `valid_from`/`valid_to` on `memory_relations` with exclusive-relation auto-close temporal awareness.
 
 **Running benchmarks:** See `benchmarks/README.md` for dataset download instructions and usage. Both session and turn granularities supported via `--granularity` flag. Turn-level scoring supports both official and strict modes via `--turn-scoring`.
 
