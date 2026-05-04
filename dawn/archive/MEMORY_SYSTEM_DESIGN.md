@@ -27,7 +27,7 @@ A comprehensive design for DAWN's persistent memory system with integrated RAG (
 - **S7 (Temporal Scoring):** ✅ Complete - Time-expression parser, Gaussian decay scoring, temporal relation bounds (valid_from/valid_to)
 - **S8 (Contradiction Detection):** ✅ Complete - Relation-driven fact supersede, expanded exclusive relations (12), contradictory pairs (4), extraction prompt with 20 relation types
 - **Phases 7-11 (RAG):** ✅ Implemented — see `docs/RAG_DESIGN.md` (separate system)
-- **Retrieval Benchmarks:** ✅ Complete - LongMemEval turn-level 95.4% R@5 (25.6pp above published SOTA), session-level 97.0% R@5, ConvoMem 99.0%, LoCoMo 73.7% — see `benchmarks/README.md`
+- **Retrieval Benchmarks:** ✅ Complete - LongMemEval turn-level 97.0% R@5 (27.2pp above published SOTA), ConvoMem 99.0%, LoCoMo 81.6% (bge-small int8 + proper-noun boost) — see `benchmarks/README.md`
 
 ---
 
@@ -185,7 +185,8 @@ Multi-provider embedding support configured via `[memory.embeddings]`:
 | -------------------- | ---------------------- | ---------- | ------ | ---------------------------------- |
 | **Ollama** (default) | nomic-embed-text       | 768        | ~20ms  | `ollama pull nomic-embed-text`     |
 | **OpenAI**           | text-embedding-3-small | 1536       | ~100ms | Requires API key                   |
-| **ONNX**             | all-MiniLM-L6-v2       | 384        | ~5ms   | Shares ONNX Runtime with Piper TTS |
+| **ONNX**             | bge-small-en-v1.5 int8 | 384        | ~15ms  | **Current default** (May 2026); +7.2pp LoCoMo vs MiniLM; shares ONNX Runtime with Piper TTS |
+| **ONNX** (previous) | all-MiniLM-L6-v2 int8  | 384        | ~8ms   | Superseded by bge-small; retained on disk for rollback |
 
 **Decision:** Support multiple embedding providers to match the LLM provider flexibility. Ollama is the default for local deployments. ONNX leverages existing runtime dependency. OpenAI provides cloud option for higher quality embeddings. Embeddings are used for both facts and entities.
 
@@ -703,7 +704,8 @@ semantic_weight = 0.6                # Hybrid search: semantic component (0.0-1.
 | -------- | ---------------------- | ---------- | ------ | ----------------------------------- |
 | Ollama   | nomic-embed-text       | 768        | ~20ms  | Local, no API key needed            |
 | OpenAI   | text-embedding-3-small | 1536       | ~100ms | Cloud, requires API key             |
-| ONNX     | all-MiniLM-L6-v2       | 384        | ~5ms   | Local, shares ONNX Runtime with TTS |
+| ONNX     | all-MiniLM-L6-v2 int8  | 384        | ~8ms   | Current default; local, shares ONNX Runtime with TTS |
+| ONNX     | bge-small-en-v1.5      | 384        | ~35ms fp32 / ~10ms int8 (est.) | Recommended upgrade; +7.4pp LoCoMo retrieval quality |
 
 **Hybrid Search:** Memory search combines keyword matching (tokenized LIKE queries) with semantic similarity (cosine distance on embeddings). The `keyword_weight` and `semantic_weight` control the blend. Results are deduplicated and sorted by combined score.
 
@@ -1842,10 +1844,11 @@ database — completely isolated from production data.
 
 Turn-level retrieval indexes each user turn as a separate document (~273 per question instead of ~48 sessions). Top-K=5, matching the RMM paper (Tan et al., ACL 2025, arxiv.org/abs/2503.08026). Methodology verified against the official LongMemEval evaluation code (github.com/xiaowu0162/LongMemEval).
 
-| Scoring | R@1 | R@3 | R@5 | NDCG@5 | Evaluated |
-|---------|-----|-----|-----|--------|-----------|
-| **Official** (any turn from answer session) | 85.4% | 93.2% | **95.4%** | 89.7% | 500 questions |
-| **Strict** (only `has_answer` turns) | 50.2% | 75.9% | **86.9%** | 69.4% | 428 questions (72 skipped) |
+| Scoring | R@1 | R@3 | R@5 | NDCG@5 | Evaluated | Model |
+|---------|-----|-----|-----|--------|-----------|-------|
+| **Official** (any turn from answer session) | 89.2% | 95.2% | **97.0%** | 92.5% | 500 questions | bge-small int8 + proper-noun boost |
+| **Official** (MiniLM baseline, April 2026) | 85.4% | 93.2% | 95.6% | 89.8% | 500 questions | all-MiniLM-L6-v2 int8 |
+| **Strict** (only `has_answer` turns) | 50.2% | 75.9% | **86.9%** | 69.4% | 428 questions (72 skipped) | all-MiniLM-L6-v2 int8 |
 
 The official scoring is directly comparable to published baselines. The strict scoring evaluates retrieval against only the specific turns annotated as containing the answer (average 1.7 targets per question vs 11 for official).
 
@@ -1853,31 +1856,78 @@ The official scoring is directly comparable to published baselines. The strict s
 
 | System | R@5 | Model | Model Size | Method |
 |--------|-----|-------|------------|--------|
-| **DAWN hybrid** | **95.4%** | all-MiniLM-L6-v2 (int8) | 22M | Cosine + keyword boost |
+| **DAWN hybrid** | **97.0%** | bge-small-en-v1.5 (int8) | 32MB | Cosine + keyword boost + proper-noun boost |
+| **DAWN hybrid** | 95.6% | all-MiniLM-L6-v2 (int8) | 22MB | Cosine + keyword boost (April 2026 baseline) |
 | RMM + GTE | 69.8% | GTE-Qwen2-7B | 7B | Cosine + RL-trained reranker |
 | RAG + GTE | 62.4% | GTE-Qwen2-7B | 7B | Cosine only |
 | RAG + Stella | 59.2% | Stella 1.5B | 1.5B | Cosine only |
 | RAG + Contriever | 54.3% | Contriever | 110M | Cosine only |
 
-DAWN's hybrid search exceeds the published SOTA (RMM + GTE) by 25.6 percentage points while using a model 300x smaller. Results verified deterministic across two independent hardware runs (Jetson Orin and Jetson AGX Orin — identical R@5 = 0.8692 on strict scoring).
+DAWN's hybrid search exceeds the published SOTA (RMM + GTE) by 27.2 percentage points while using a model 200x smaller. Results verified deterministic across two independent hardware runs (Jetson Orin and Jetson AGX Orin — identical R@5 = 0.8692 on strict scoring).
 
 **Why keyword boosting is effective at turn-level:**
 
 At session level, documents are 500-2000 characters (all user turns concatenated) — keyword matching has moderate discriminative power since common words appear across many sessions. At turn level, documents are 50-200 characters (single messages) — keyword matching becomes highly discriminative because short documents either contain a query word or they don't. That binary signal on top of fuzzy cosine breaks ties the embedding model alone can't resolve. The effect amplifies as document granularity decreases.
 
+**LoCoMo category breakdown and analysis (May 2026):**
+
+LoCoMo QA pairs fall into 5 categories. Understanding which categories are hard and why shapes the improvement roadmap:
+
+| Category | Description | MiniLM baseline | +proper-noun boost | +bge-small | Root cause of gap |
+|----------|-------------|-----------------|-------------------|------------|-------------------|
+| **1** | Profile/identity facts ("What is Caroline's relationship status?") | 64.8% | 64.8% | 69.1% | Fact stated once, often indirectly; semantic gap between question vocabulary and answer vocabulary |
+| **2** | Temporal ("When did X happen?") | 79.7% | 80.5% | 85.6% | Temporal boost + proper-noun boost effective; most headroom already captured |
+| **3** | Inference/counterfactual ("Would she enjoy X?") | 58.0% | 58.0% | 63.0% | Evidence never directly answers; requires reasoning across multiple facts; retrieval ceiling is fundamental |
+| **4** | Event detail ("What did the race raise awareness for?") | 74.8% | 74.8% | 84.1% | Co-located with event; stronger model bridges vocabulary gap well |
+| **5** | Consequence/reflection ("What did she realize after X?") | 78.9% | 78.9% | 86.8% | Usually stated in same session as event; strong lift from better model |
+
+**Key findings from May 2026 ablation study:**
+
+1. **Proper-noun boost (+1.0 weight on capitalized keyword matches):** +0.7pp overall, predominantly cat-2 (+0.8pp) and cat-3 (+2.2pp). Zero effect on cat-1 because every chunk starts with the speaker name — the name matches uniformly and doesn't discriminate. Implemented as `--proper-noun-boost` flag in `bench_retrieval` and passed through `run_benchmark.py`.
+
+2. **Sentence-level chunking:** Zero effect on LoCoMo. LoCoMo dialog turns are already short single utterances — there is no multi-sentence dilution to remove. Hypothesis was valid but the data structure doesn't have the problem.
+
+3. **Embedding model comparison** (all runs: hybrid + proper-noun-boost 1.0 + temporal-weight 0.20):
+
+| Model | ONNX size | Per-embed (Jetson) | Overall | Cat-1 | Cat-2 | Cat-3 | Recommendation |
+|-------|-----------|-------------------|---------|-------|-------|-------|----------------|
+| all-MiniLM-L6-v2 int8 | 22MB | ~8ms | 74.4% | 64.8% | 80.5% | 58.0% | Current default |
+| all-MiniLM-L12-v2 int8 ARM64 | 32MB | ~15ms | 73.5% | 64.4% | 79.3% | 56.4% | Worse — same family, depth doesn't help |
+| bge-small-en-v1.5 fp32 | 127MB | ~35ms | 81.8% | 69.1% | 85.6% | 63.0% | Good but fp32 |
+| **bge-small-en-v1.5 int8** | **32MB** | **~15ms** | **81.6%** | **69.3%** | **84.9%** | **64.4%** | **✅ Ship this** |
+| bge-base-en-v1.5 fp32 | 416MB | ~117ms | 83.2% | 70.6% | 86.1% | 62.2% | Diminishing returns |
+| bge-large-en-v1.5 fp32 | 1.3GB | ~396ms | 82.9% | 70.2% | 86.6% | 65.0% | Not practical on Jetson |
+
+**bge-small int8 is the production recommendation:** Same 32MB footprint as current model, ~2x embedding latency (~15ms vs ~8ms), +7.2pp overall retrieval quality, +4.5pp cat-1, +6.4pp cat-3. Quantization loses only 0.2pp vs fp32 — essentially lossless. Source: `Xenova/bge-small-en-v1.5`, `onnx/model_int8.onnx`.
+
+`DAWN_ONNX_MODEL` / `DAWN_ONNX_VOCAB` env vars now override the hardcoded model path in `memory_embed_onnx.c` for experimentation without recompilation.
+
+**Lesson from MiniLM-L12 experiment:** Doubling depth within the same model family (L6→L12, identical 32MB int8) yields almost nothing (+0pp cat-1, flat overall). The quality gain is entirely about the model family (MiniLM → BGE), not depth within the family.
+
+4. **Cat-1 root cause:** Profile facts are rarely stated directly ("I'm single") — they surface through indirect phrasing ("tough breakup", "challenging as a single parent"). The semantic gap between question vocabulary and evidence vocabulary is too large for MiniLM-L6 to bridge reliably. bge-small closes this gap meaningfully (+4.3pp). Further improvement likely requires either (a) a larger model, or (b) memory extraction at write time — extracted facts like `{entity: "Caroline", relation: "relationship_status", value: "single"}` would match the question perfectly regardless of model quality, since the benchmark measures retrieval over raw turns while DAWN searches over extracted facts in production.
+
+5. **Cat-3 ceiling:** Inference/counterfactual questions have a structural retrieval ceiling. Even bge-large (fp32) only reaches 65%. The evidence is present in the indexed turns, but no single turn "answers" the question — the answer requires multi-fact synthesis. The benchmark metric (fraction of annotated evidence turns in top-K) undersells DAWN's production performance here since the extracted entity profile approach would sidestep the problem entirely.
+
+**Benchmark harness fix (May 2026):** `run_benchmark.py` had a subprocess deadlock: Python's `select` + `TextIOWrapper.readline()` with `bufsize=1` on a pipe deadlocked because the kernel reports data ready but libc holds it in a full-buffering buffer when stdout is a pipe (not a TTY). Fixed by switching to raw `os.read()` in the orchestrator and adding `setvbuf(stdout, NULL, _IOLBF, 0)` at `bench_retrieval` startup. `fflush(output_stream)` also added to `common/src/logging.c` per-line to fix the same class of fragility for any future subprocess consumer of a DAWN binary.
+
+**Important:** Always pass `--temporal-weight 0.20` when running LoCoMo benchmarks. The orchestrator defaults to 0.0 (disabled); omitting this flag gives pre-S7 baseline numbers and makes results look like a regression.
+
 **Analysis:**
 
-- **LongMemEval**: Strong results across granularities. The ~30 lines of keyword boost code in `document_search.c:107-175` provides the majority of the performance advantage over academic baselines.
-- **LoCoMo**: Overall 73.7% after S6/S7. Temporal inference (category 3) improved from 51.5% to 55.8% with temporal scoring; category 2 (temporal facts) from 76.7% to 79.9%. Category 5 (adversarial) scores 76.0%. Remaining gaps are in category 3 inference questions requiring multi-hop reasoning.
-- **ConvoMem**: 99.0% recall on per-message retrieval demonstrates strong fine-grained search quality. The keyword boost helps surface exact-match evidence.
+- **LongMemEval**: 97.0% R@5 with bge-small int8 + proper-noun boost (+1.4pp over MiniLM baseline). NDCG@5 92.5% (+2.7pp). The model swap and scoring improvements are additive with the existing keyword boost advantage over academic baselines.
+- **LoCoMo**: 81.6% with bge-small int8 + proper-noun boost + temporal-weight 0.20 (+7.2pp over MiniLM baseline). Temporal weight sweep (0.20/0.25/0.30) confirms 0.20 is already optimal. Cat-3 at 64.4% remains the hard ceiling for retrieval-only approaches.
+- **ConvoMem**: 99.0% — no change from model swap. Ceiling effects; unlikely to improve without dataset-specific tuning.
+- **Top-K depth experiment (critical finding):** At top-K=15 vs top-K=10 with bge-small int8, overall recall jumps from 81.6% to **89.9%** (+8.3pp). Cat-3 alone goes 64.4% → **77.8%** (+13.4pp). The evidence for inference questions IS being retrieved — it falls at ranks 11-15, just outside the cutoff. This strongly motivates a cross-encoder reranker: retrieve top-20, rerank to top-10. Even moderate promotion of the correct answer from rank 12 to rank 8 would capture most of this gain without increasing the LLM context window.
 
-**Identified gaps from benchmarking (status as of April 2026):**
+**Identified gaps from benchmarking (status as of May 2026):**
 
 1. ~~**No temporal scoring**~~ → ✅ **Resolved in S7.** `time_query_parser.c` recognizes temporal expressions; additive Gaussian decay boosts time-anchored queries. LoCoMo cat-2 lifted 76.7%→79.9%, cat-3 51.5%→55.8%.
 2. ~~**No fact categorization**~~ → ✅ **Resolved in S6.** 8-label taxonomy with SQL-level pre-filtering via `memory_db_fact_search_by_category()`. LLM recategorization covers ~99.8% of existing facts.
 3. ~~**No relation temporality**~~ → ✅ **Resolved in S7.** Schema v33 adds `valid_from`/`valid_to` on `memory_relations` with exclusive-relation auto-close temporal awareness.
+4. ~~**Weak embedding model for cat-1 profile facts**~~ → ✅ **Benchmarked, ready to ship.** `bge-small-en-v1.5 int8` (32MB, ~15ms, `Xenova/bge-small-en-v1.5`) benchmarked at +7.2pp overall, +4.5pp cat-1. Drop-in swap: change `MODEL_PATH` in `memory_embed_onnx.c`, update default in `dawn.toml`. `DAWN_ONNX_MODEL` env var override available for zero-recompile switching.
+5. **Cat-3 inference questions** → Top-K=15 experiment confirms evidence IS present at ranks 11-15 (+13.4pp cat-3 at depth 15 vs 10). Cross-encoder reranker (TODO.md) is the right fix: retrieve top-20, rerank to top-10. Projected gain: +8pp overall, +13pp cat-3. LLM-in-loop synthesis or entity-profile retrieval would additionally help for the remaining ceiling after reranking.
 
-**Running benchmarks:** See `benchmarks/README.md` for dataset download instructions and usage. Both session and turn granularities supported via `--granularity` flag. Turn-level scoring supports both official and strict modes via `--turn-scoring`.
+**Running benchmarks:** See `benchmarks/README.md` for dataset download instructions and usage. Both session and turn granularities supported via `--granularity` flag. Turn-level scoring supports both official and strict modes via `--turn-scoring`. Always pass `--temporal-weight 0.20` for LoCoMo.
 
 ### 14.4 Evaluation Metrics
 
