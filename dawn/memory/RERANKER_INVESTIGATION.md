@@ -20,7 +20,7 @@ don't repeat the investigation in six months.
 
 ## Original Premise
 
-`docs/EMBEDDING_UPGRADE_PLAN.md` §Feature 2 noted that LoCoMo recall jumps
+The original embedding-upgrade plan (now archived as `EMBEDDING_UPGRADE.md`, sibling) §Feature 2 noted that LoCoMo recall jumps
 from 81.6 % at top-K=10 to 89.9 % at top-K=15 — meaning the right
 evidence sat at ranks 11–15 for ~8 % of questions.  The plan inferred that
 a cross-encoder reranker could pull those items into top-10 by scoring
