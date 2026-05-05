@@ -155,6 +155,49 @@ model = "qwen2.5:7b"         # Model name for that provider
 
 **Decision:** Globally configurable provider + model for consistency across all extraction.
 
+#### 3.2.1 Four-Model Extraction Sweep (May 2026)
+
+Full LoCoMo (10 convs, 1982 QA) was run with four extraction models, holding
+embedding model + judge + generator constant at `bge-small-en-v1.5-int8` /
+`claude-haiku-4-5` / `claude-haiku-4-5`:
+
+| Extraction model | reach | ent | gen |
+|---|---|---|---|
+| `claude-haiku-4-5` | 0.7392 | 0.2568 | 0.2084 |
+| `claude-sonnet-4-6` | **0.7506** | **0.2583** | **0.2250** |
+| `claude-opus-4-6` | 0.6739 | 0.1821 | 0.1599 |
+| `Qwen3.6-35B-A3B-Q4_K_M` (local) | 0.6186 | 0.1700 | 0.1564 |
+
+**Findings:**
+
+1. **Sonnet wins overall but only barely** — `recall_generation` +1.7 pp
+   over Haiku, `recall_entailment` essentially tied. For ~5× the cost, this
+   is not a meaningful price/performance gain.
+2. **Opus is meaningfully worse than Haiku** — `gen` -4.9 pp, `ent` -7.5 pp.
+   Inspection shows Opus produces 2-3× the entity count per conversation
+   (~43 entities/conv vs Haiku's ~15), suggesting it over-fragments the
+   entity graph; the resulting facts retrieve less reliably even though
+   raw fact counts are similar.
+3. **Local Qwen3.6-35B-A3B trails the cloud field** — `gen` 0.156 is just
+   below Opus and well below Haiku/Sonnet. For a fully-local deployment
+   it's a real option (free, runs in ~3 hours); for cloud-OK deployments
+   Haiku is plainly better.
+4. **Cat-2 temporal is broken across all four models** — 0.02-0.03
+   `recall_generation`. The bottleneck is extraction-side info loss
+   (dates getting dropped during fact extraction), not model strength.
+   This is independent of the model-selection question and is the
+   highest-leverage future improvement target.
+
+**Recommendation:** `claude-haiku-4-5` for both `compact_model` and
+`extraction_model`. The same model for summarization and extraction is fine —
+the sweep gives no evidence that a stronger Claude tier produces better
+extraction shape, and gives clear evidence that the strongest tier (Opus)
+is actively worse. Going larger is *not* a free win; the model has to follow
+the extraction prompt's structural expectations, not just generate text.
+
+Raw data: `benchmarks/snapshots/sweep_results.json`. Reproduction:
+`benchmarks/README.md` "four-model extraction sweep" section.
+
 ### 3.3 Context Budget
 
 **800 tokens default**, configurable via `memory.context_budget_tokens`.
@@ -1773,7 +1816,7 @@ The original 14-pattern blocklist was replaced with a comprehensive filter in S5
 - Filter wired into all ingestion paths (tool callback, extraction, WebUI import)
 - 137 unit tests validate pattern coverage and normalization bypass resistance
 
-See S5 phase section for full details. Design doc archived: `docs/MEMORY_INJECTION_FILTER.md`.
+See S5 phase section for full details. Design doc archived: `INJECTION_FILTER.md` (sibling).
 
 **Why not a dedicated safety model?**
 

@@ -16,7 +16,7 @@ actual cat-3 misses changes that recommendation:
 
 1. **The published 64.4% cat-3 baseline is at session granularity, not
    dialog granularity.** Argparse default for `--granularity` is `session`;
-   benchmarks/README.md and atlas MEMORY_SYSTEM_DESIGN.md both incorrectly
+   benchmarks/README.md and atlas memory/SYSTEM_DESIGN.md both incorrectly
    claim "dialog granularity, top-K=10." At true dialog granularity (one
    doc per dialog turn — the production-aligned setting), cat-3 = **44.6%**.
 
@@ -112,7 +112,7 @@ produces IDs of the form `D7:5` — dialog-level. The published 64.4%
 cat-3 number is reproducible only at session granularity.
 
 **Impact on baselines:** the published "81.6% LoCoMo overall, 64.4% cat-3"
-numbers (benchmarks/README.md, atlas MEMORY_SYSTEM_DESIGN.md §14.3) are
+numbers (benchmarks/README.md, atlas memory/SYSTEM_DESIGN.md §14.3) are
 session-level. Dialog-level numbers from the same harness:
 
 | Granularity | Overall | Cat-3 |

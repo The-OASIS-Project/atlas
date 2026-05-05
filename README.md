@@ -71,15 +71,23 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [PLEX_INTEGRATION_DESIGN](dawn/archive/PLEX_INTEGRATION_DESIGN.md) | Plex Media Server music streaming integration |
 | [SMARTTHINGS](dawn/archive/SMARTTHINGS.md) | SmartThings OAuth integration (blocked at AWS WAF) |
 
-### Memory and RAG
+### Memory Subsystem
+
+Memory has its own subdirectory at [`dawn/memory/`](dawn/memory/) — see the [memory README](dawn/memory/README.md) for an annotated index. Entries below are the canonical pointers from the top-level Atlas index.
 
 | Document | Description |
 |----------|-------------|
-| [MEMORY_SYSTEM_DESIGN](dawn/archive/MEMORY_SYSTEM_DESIGN.md) | Persistent memory: entity graph, relations, facts, semantic embeddings, hybrid search, contacts, entity merge, retrieval benchmarking (Phases 1–6.7 + S4 + 13) |
-| [MEMORY_INJECTION_FILTER](dawn/archive/MEMORY_INJECTION_FILTER.md) | Memory injection filter: shared blocklist module with Unicode normalization (homoglyphs, accents, fullwidth, invisible chars), ~118 patterns across 17 categories, data-marking framing, all-path coverage (tool/extraction/import), 137 unit tests |
-| [RERANKER_INVESTIGATION](dawn/archive/RERANKER_INVESTIGATION.md) | Cross-encoder reranker investigation: implemented (ms-marco-MiniLM-L-6-v2 int8 ONNX with CUDA EP, integration across memory + RAG paths, 5 config keys) then reverted after empirical results and literature review showed no net benefit on conversational data and only marginal lift on LongMemEval at 10× latency. Kept artifacts: shared WordPiece tokenizer (`memory_embed_tokenizer`), `rerank_shootout.py` test harness |
-| [LOCOMO_CAT3_PROFILING](dawn/archive/LOCOMO_CAT3_PROFILING.md) | LoCoMo cat-3 failure-mode profiling, session-neighbor boost (Tier 2 quick win, +3.0pp dialog overall / +20.0pp cat-3), and memory-pipeline bench mode (Tier 1, Phase 0/1/1.5): end-to-end LoCoMo evaluation against extracted memory at production parity, `recall_reach` metric, Haiku 4.5 result of 0.742 / 0.646 cat-3 (+9.3pp / +20pp over dialog baseline). Identifies retrieval vs answer-support framing for closing the gap to leaders |
-| [RAG_DESIGN](dawn/archive/RAG_DESIGN.md) | Document search / RAG: chunking, embeddings, hybrid semantic+keyword search, WebUI Document Library, admin management, `document_index` URL tool |
+| [SYSTEM_DESIGN](dawn/memory/SYSTEM_DESIGN.md) | Persistent memory: entity graph, relations, facts, semantic embeddings, hybrid search, contacts, entity merge, retrieval benchmarking (Phases 1–6.7 + S4 + 13) |
+| [INJECTION_FILTER](dawn/memory/INJECTION_FILTER.md) | Memory injection filter: shared blocklist module with Unicode normalization (homoglyphs, accents, fullwidth, invisible chars), ~118 patterns across 17 categories, data-marking framing, all-path coverage (tool/extraction/import), 137 unit tests |
+| [CAT2_TEMPORAL](dawn/memory/CAT2_TEMPORAL.md) | Cat-2 temporal extraction collapse (LoCoMo): failure-mode taxonomy (A1/A2/B/C/D/E), Phase 1 = conversation anchor injection (schema v42 `conversations.anchor_date`), live result `recall_generation` cat-2 0.022 → 0.321 (+29.9pp), overall +7.1pp. Phase 2 (`event_when` field) re-scoped after Phase 1 exceeded the original L1+L2 mid-projection. Companion: [CAT2_TEMPORAL_INVESTIGATION_PLAN](dawn/memory/CAT2_TEMPORAL_INVESTIGATION_PLAN.md) |
+| [RERANKER_INVESTIGATION](dawn/memory/RERANKER_INVESTIGATION.md) | Cross-encoder reranker investigation: implemented (ms-marco-MiniLM-L-6-v2 int8 ONNX with CUDA EP, integration across memory + RAG paths, 5 config keys) then reverted after empirical results and literature review showed no net benefit on conversational data and only marginal lift on LongMemEval at 10× latency. Kept artifacts: shared WordPiece tokenizer (`memory_embed_tokenizer`), `rerank_shootout.py` test harness |
+| [LOCOMO_CAT3_PROFILING](dawn/memory/LOCOMO_CAT3_PROFILING.md) | LoCoMo cat-3 failure-mode profiling, session-neighbor boost (Tier 2 quick win, +3.0pp dialog overall / +20.0pp cat-3), and memory-pipeline bench mode (Tier 1, Phase 0/1/1.5): end-to-end LoCoMo evaluation against extracted memory at production parity, `recall_reach` metric, Haiku 4.5 result of 0.742 / 0.646 cat-3 (+9.3pp / +20pp over dialog baseline). Identifies retrieval vs answer-support framing for closing the gap to leaders |
+
+### RAG (Document Search)
+
+| Document | Description |
+|----------|-------------|
+| [RAG_DESIGN](dawn/archive/RAG_DESIGN.md) | Document search / RAG: chunking, embeddings, hybrid semantic+keyword search, WebUI Document Library, admin management, `document_index` URL tool. Sibling to memory — shares `embedding_engine.c` but operates on `document_chunks`, not `memory_facts`. |
 
 ### Scheduler and Tools
 
