@@ -77,6 +77,7 @@ Memory has its own subdirectory at [`dawn/memory/`](dawn/memory/) — see the [m
 
 | Document | Description |
 |----------|-------------|
+| [STATE](dawn/memory/STATE.md) | **Living snapshot.** Current state of the memory subsystem — recently shipped, benchmark position, short/medium/long-term workstreams in priority order. Read first when starting memory-focused work. |
 | [SYSTEM_DESIGN](dawn/memory/SYSTEM_DESIGN.md) | Persistent memory: entity graph, relations, facts, semantic embeddings, hybrid search, contacts, entity merge, retrieval benchmarking (Phases 1–6.7 + S4 + 13) |
 | [INJECTION_FILTER](dawn/memory/INJECTION_FILTER.md) | Memory injection filter: shared blocklist module with Unicode normalization (homoglyphs, accents, fullwidth, invisible chars), ~118 patterns across 17 categories, data-marking framing, all-path coverage (tool/extraction/import), 137 unit tests |
 | [EMBEDDING_UPGRADE](dawn/memory/EMBEDDING_UPGRADE.md) | bge-small-en-v1.5-int8 model swap + tech-debt cache-invalidation fix + ID-based extraction filter + per-user embedding recompute worker (schema v41). Lifted LoCoMo overall +7.9pp, LongMemEval R@5 +1.4pp. Cross-encoder reranker was Feature 2 of the original plan — investigated and reverted (see RERANKER_INVESTIGATION). |
