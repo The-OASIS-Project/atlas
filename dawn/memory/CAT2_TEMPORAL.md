@@ -1,10 +1,10 @@
-# Cat-2 Temporal Extraction — Diagnosis & Phase 1 Result
+# Cat-2 Temporal Extraction — Diagnosis, Phase 1 Result, Phase 1.1 Subject-Naming Fix
 
-**Status:** Phase 1 (L1 + L5) shipped 2026-05-05. Phase 2 (L2 / structured `event_when` field) re-scoped — see "Phase 1 result vs projection" below.
+**Status:** Phase 1 (L1 + L5) shipped 2026-05-05. **Phase 1.1 (subject-naming prompt fix) shipped 2026-05-05** — recovered the cat-1 regression and added another +9.2pp overall on top of Phase 1. Phase 2 (L2 / structured `event_when` field) re-scoped — see "Phase 1.1 result" below.
 
 **Date:** 2026-05-05.
 
-**TL;DR:** Cat-2 collapse was dominated by **lost dates at extraction time**, not retrieval / ranking / generator blindness. Two distinct failure modes drove ~95% of the loss: (1) **mode A** — relative phrases like "yesterday" / "this month" / "five years ago" couldn't be resolved because the extraction LLM never saw a conversation anchor date; (2) **mode C** — specific time-bounded events dropped during session-window condensation. **Phase 1 (anchor injection only) lifted cat-2 `recall_generation` from 0.022 → 0.321 (+29.9pp), exceeding the projected ~0.15-0.25 range and overall LoCoMo by +7.1pp (0.208 → 0.279).** L2's structured `event_when` field becomes a much smaller marginal win and is re-scoped accordingly.
+**TL;DR:** Cat-2 collapse was dominated by **lost dates at extraction time**, not retrieval / ranking / generator blindness. Two distinct failure modes drove ~95% of the loss: (1) **mode A** — relative phrases like "yesterday" / "this month" / "five years ago" couldn't be resolved because the extraction LLM never saw a conversation anchor date; (2) **mode C** — specific time-bounded events dropped during session-window condensation. **Phase 1 (anchor injection only) lifted cat-2 `recall_generation` from 0.022 → 0.321 (+29.9pp)**, but introduced a −3.9pp cat-1 regression because the "preserve original phrase" instruction caused Haiku to drop subject names. **Phase 1.1 (added an explicit subject-naming rule + scoped temporal phrase preservation to event-bearing facts) recovered cat-1 to 0.316 (+10.7pp over the original baseline) AND lifted cat-2 to 0.492 (+17.1pp on top of Phase 1).** Overall LoCoMo `recall_generation` 0.208 → 0.279 (Phase 1) → **0.371 (Phase 1.1, +16.3pp over baseline)**.
 
 ---
 
@@ -31,7 +31,49 @@ Cat-2 entailment also surged: 0.022 → 0.396 (+37.4pp). Reach effectively uncha
 
 **What changed in the Phase 2 calculus.** The diagnosis projected Phase 1+2 at cat-2 ~0.40-0.55. Phase 1 alone reached 0.321. The remaining ~10-20pp on cat-2 is the "mode C" event-coverage gap (events dropped during session condensation) — which the structured `event_when` field doesn't directly address; it just gives surviving events a structured place to land. L2 / L3 / L4 budget should be re-evaluated against (a) the cat-1 regression investigation, (b) whether mode C cases can be addressed by a smaller prompt-only event-coverage rev, and (c) whether the ~3-day Phase 2 spend is the highest-leverage memory work on the board now that cat-2 is no longer the bleeding edge.
 
-**Cat-1 regression (−3.9pp) — known, not yet investigated.** Likely cause: anchor injection adds context that's irrelevant for atemporal factual recall. Worth a focused look (~½ day) before Phase 2 starts. Keep the lift; don't ship Phase 2 without understanding the trade.
+**Cat-1 regression (−3.9pp) — investigated and resolved (Phase 1.1).** Root cause was **subject-name elision**, not anchor noise. The Phase 1 prompt added a bullet asking the LLM to "preserve the original phrase in fact text — both forms are useful." Combined with the legacy "Analyze this conversation and extract user information" framing on line 1, Haiku interpreted the instruction broadly and started writing facts in first-person diary style ("Attended a support group on 2023-05-07" instead of "Caroline attended a support group on 2023-05-07"). The bench's generator template (`run_benchmark.py:531`) renders only `fact_text` — no entity tags, no source attribution — so a retrieved fact without the subject can't tell the generator who it's about, and the cat-1 generator answered "I don't know" or guessed wrong.
+
+Quantified across 278 cat-1 questions with a named subject in the question:
+
+| Conv | #cat-1 Qs | facts mentioning subject (pre-Phase-1) | facts mentioning subject (Phase 1) | %loss |
+|---:|---:|---:|---:|---:|
+| 0 | 32 | 92.6 | 9.6 | **−89.6%** |
+| 4 | 31 | 134.1 | 32.7 | **−75.6%** |
+| 9 | 32 | 87.6 | 23.4 | **−73.3%** |
+| 7 | 21 | 141.7 | 98.3 | −30.6% |
+| 5 | 29 | 70.3 | 41.1 | −41.5% |
+| 1, 3, 6, 8 | 102 | 102.4 | 102.0 | within noise |
+| 2 | 30 | 15.1 | 31.7 | +110% (random recovery) |
+
+Overall: 38% drop in subject-named facts. The variability across conversations is consistent with prompt-noise on Haiku rather than a uniform rule.
+
+## Phase 1.1 result
+
+The Phase 1.1 prompt patch (in `src/memory/memory_extraction.c`):
+
+1. **Tightens the temporal-phrase preservation rule** so it triggers only when a fact describes a time-bounded event ("Caroline gave a school talk last Friday (2023-05-19)"), not as a general "rephrase like the original utterance" instruction.
+2. **Adds an explicit subject-naming rule** that calls out the diary-style failure mode by name: *"ALWAYS name the subject of each fact explicitly. Do NOT write facts in first-person diary style ('Attended X', 'Has children') — always name the person the fact is about ('Caroline attended X', 'Melanie has children')."*
+
+Per-category `recall_generation` on LoCoMo, Haiku extraction + judge + generator + correctness (n=1982):
+
+| Category | Pre baseline | Phase 1 | **Phase 1.1** | vs baseline | vs Phase 1 |
+|---|---:|---:|---:|---:|---:|
+| **cat-1 (single-hop)** | 0.209 | 0.170 | **0.316** | **+10.7pp** | **+14.6pp** |
+| **cat-2 (temporal)** | 0.022 | 0.321 | **0.492** | **+47.0pp** | **+17.1pp** |
+| cat-3 (multi-hop) | 0.228 | 0.272 | **0.326** | +9.8pp | +5.4pp |
+| cat-4 (knowledge update) | 0.316 | 0.366 | **0.473** | +15.7pp | +10.7pp |
+| cat-5 (adversarial) | 0.135 | 0.155 | **0.135** | 0 | −2.0pp |
+| **Overall** | **0.208** | **0.279** | **0.371** | **+16.3pp** | **+9.2pp** |
+
+Bench wall-clock 1h 10min, all 10 convs cache-hit (extraction cached from earlier same-day pass), one transient SSL handshake error during conv 7 (~0.05% — fail-closed; the +9.2pp is *despite* this noise). `recall_reach` overall stayed at 0.828 — the lift is purely from extraction quality (subject-named facts let the generator attribute correctly), not retrieval.
+
+The over-correction on subject mentions was deliberate — v2 produces ~150% as many subject-named facts as the pre-baseline (94/conv → 146/conv). That extra subject density gives the generator multiple disambiguation paths, which appears to compound with the cat-2 temporal lift to push every category above its Phase 1 number except cat-5 (within noise on 446 questions).
+
+**Bench-harness bug uncovered during validation.** The first attempt to measure Phase 1.1 produced `recall_generation` collapsing to ~0.06 by conv 8. Root cause was a stale-cache bug in `bench_memory_pipeline.c`: `handle_snapshot_load` and `handle_reset_memory` swap the SQLite tables but never invalidated the in-memory fact / entity embedding caches. Cache-HIT replays therefore searched the previous snapshot's embeddings against the current snapshot's dia_map, returning facts whose provenance pointed to msg_ids in earlier conversations. covered_dia_ids was empty for every retrieved fact past conv 0, and recall went to zero. The Phase 1 measurement (and all earlier published numbers) escaped this because they ran fresh extraction in the same process pass — extraction's own `embed_and_store` call invalidated the cache after every fact write. Fixed by adding `memory_embeddings_invalidate_cache()` + `memory_embeddings_invalidate_entity_cache()` calls to both bench handlers. Production `memory_db_delete_user_memories` (called from the WebUI "delete all my memories" path) appears to have the same gap; tracked separately in `dawn/docs/TODO.md` as a follow-up audit.
+
+## What changed in the Phase 2 calculus (post-Phase-1.1)
+
+After Phase 1 alone hit cat-2 0.321 the remaining ~10-20pp gap looked like the "mode C" event-coverage gap, which the structured `event_when` field doesn't directly address. After Phase 1.1 lifted cat-2 to 0.492 *without* changing the schema, that conclusion is even stronger — the L2 spec is settled in the section below if pursued, but the ~3-day spend should be re-justified against (a) provenance / source-linked recall, (b) speaker mis-attribution, (c) cat-3 multi-hop work, all of which are now higher-leverage than another temporal-storage refinement.
 
 ---
 

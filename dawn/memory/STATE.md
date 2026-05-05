@@ -2,15 +2,15 @@
 
 **Purpose:** living snapshot of where the memory subsystem stands. Read this at the start of any memory-focused work session before diving into individual atlas docs or `dawn/docs/TODO.md`. Refresh when a major shipment lands.
 
-**Last updated:** 2026-05-05 (after Cat-2 Temporal Phase 1 ship + atlas/dawn/memory/ reorg).
+**Last updated:** 2026-05-05 (after Cat-2 Temporal Phase 1 + Phase 1.1 subject-naming fix + bench cache-invalidate fix + production cache-invalidate fold-in).
 
 ---
 
 ## At a glance
 
-The memory subsystem is in good shape. LongMemEval (97.0% R@5) and ConvoMem (99.0%) are essentially solved. LoCoMo cat-2 (temporal) just got a structural fix that lifted `recall_generation` from 0.022 → 0.321 (+29.9pp) via conversation anchor injection. The remaining benchmark alpha is on **cat-3 multi-hop inference (64.4%)** — graph-based competitors get +20-35pp here and closing it likely requires architectural work, not parameter tuning. Cross-encoder reranking is **dead** (built, integrated, reverted — see RERANKER_INVESTIGATION.md).
+The memory subsystem is in good shape. LongMemEval (97.0% R@5) and ConvoMem (99.0%) are essentially solved. LoCoMo `recall_generation` lifted twice this week: Phase 1 (anchor injection) 0.208 → 0.279 (+7.1pp), Phase 1.1 (subject-naming prompt fix) 0.279 → **0.371** (+9.2pp on top, +16.3pp total). Cat-1 single-hop also recovered through Phase 1.1 — went from baseline 0.209 → Phase 1 regression 0.170 → **0.316** (+10.7pp over baseline). The remaining benchmark alpha is on **cat-3 multi-hop inference** — graph-based competitors get +20-35pp on retrieval here and closing it likely requires architectural work, not parameter tuning. Cross-encoder reranking is **dead** (built, integrated, reverted — see RERANKER_INVESTIGATION.md).
 
-Short-term focus: ~2 days of Phase 1 consolidation (cat-1 regression investigation, Phase 2 re-scope decision, micro-bench promotion, legacy-data filter scan) clears the cycle. After that, the medium-term roadmap is provenance + injection-filter multi-language + speaker mis-attribution.
+Short-term focus: micro-bench promotion + legacy-data filter scan is what's left of Phase 1 consolidation (~agent 1 hr · api ~$2 · 2 ckpt). After that, the medium-term roadmap is provenance + injection-filter multi-language + speaker mis-attribution.
 
 ---
 
@@ -20,7 +20,8 @@ Short-term focus: ~2 days of Phase 1 consolidation (cat-1 regression investigati
 |---|---|---|---|
 | **bge-small-int8 + recompute worker + ID-based extraction filter** (May 2026) | v41 | LoCoMo overall +7.9pp (73.7→81.6), LongMemEval R@5 +1.4pp (95.6→97.0), cat-3 +8.6pp. Live recompute of 2,183 embeddings + 243 chunks. CI 38→40. | [EMBEDDING_UPGRADE.md](EMBEDDING_UPGRADE.md) |
 | **Cross-encoder reranker** (May 2026) | — | Built ms-marco-MiniLM-L-6-v2 int8 ONNX with CUDA EP, full integration, 5 config keys. **Reverted** — no net benefit on conversational data, marginal lift on LongMemEval at ~10× retrieval latency. Kept artifacts: WordPiece tokenizer, `rerank_shootout.py` test harness. Don't revisit unless new evidence. | [RERANKER_INVESTIGATION.md](RERANKER_INVESTIGATION.md) |
-| **Cat-2 temporal Phase 1: conversation anchor injection** (May 2026) | v42 | Cat-2 `recall_generation` 0.022 → 0.321 (+29.9pp), overall +7.1pp, cat-3 +4.4pp & cat-4 +5.0pp bonus. Cat-1 regressed −3.9pp (tracked, not yet investigated). | [CAT2_TEMPORAL.md](CAT2_TEMPORAL.md) |
+| **Cat-2 temporal Phase 1: conversation anchor injection** (May 2026) | v42 | Cat-2 `recall_generation` 0.022 → 0.321 (+29.9pp), overall +7.1pp, cat-3 +4.4pp & cat-4 +5.0pp bonus. Cat-1 regressed −3.9pp — root-caused to subject-name elision in Phase 1.1 below. | [CAT2_TEMPORAL.md](CAT2_TEMPORAL.md) |
+| **Cat-2 temporal Phase 1.1: subject-naming prompt fix + bench/prod cache-invalidate** (May 2026) | — | Tightened the Phase 1 "preserve original phrase" rule to event-bearing facts only AND added an explicit subject-naming requirement. Lifted overall `recall_generation` 0.279 → **0.371** (+9.2pp on top of Phase 1, +16.3pp over baseline); cat-1 recovered to **0.316** (+10.7pp over baseline); cat-2 lifted further to **0.492** (+17.1pp on top of Phase 1); cat-3/4 also +5.4 / +10.7pp. Validation uncovered a stale-cache bug in `bench_memory_pipeline.c` (snapshot_load + reset_memory weren't invalidating the in-memory embedding cache, causing cache-HIT replays to give false-zero recall on every conv past the first); fix folded in as `memory_embeddings_invalidate_all()` helper. Same gap existed in production `memory_db_delete_user_memories` (WebUI "delete my memories" path) — also fixed. | [CAT2_TEMPORAL.md](CAT2_TEMPORAL.md) Phase 1.1 |
 | **Memory injection filter** (April 2026) | — | `memory_filter.c/h` Layer 2 module, ~118 patterns / 17 categories, Unicode normalization (homoglyphs / Latin-1 / fullwidth / invisible chars / UTF-8 validation), data-marking framing in system prompt, 137 unit tests. All ingestion paths gated. | [INJECTION_FILTER.md](INJECTION_FILTER.md) |
 | **LoCoMo cat-3 profiling + session-neighbor boost** (May 2026) | — | Identified that retrieval-vs-answer-support framing matters; bench-only +3.0pp dialog overall / +20.0pp cat-3 boost. Production retrieval unchanged. Documented bench harness measures `document_chunks` not `memory_facts` — motivated the memory-pipeline bench mode. | [LOCOMO_CAT3_PROFILING.md](LOCOMO_CAT3_PROFILING.md) |
 
@@ -52,29 +53,29 @@ Numbers reflect post-bge-small-swap baseline (May 2026). For competitor citation
 
 "Does the LLM produce the right answer given retrieved facts?" — production-faithful, not directly comparable to retrieval-only competitor numbers.
 
-| Category | Pre-Phase-1 | Post-Phase-1 |
-|---|---|---|
-| Overall | 0.208 | **0.279** |
-| Cat-1 (single-hop) | 0.209 | 0.170 (regressed −3.9pp) |
-| Cat-2 (temporal) | 0.022 | **0.321** |
-| Cat-3 (multi-hop) | 0.228 | 0.272 |
-| Cat-4 (knowledge update) | 0.316 | 0.366 |
-| Cat-5 (adversarial) | 0.135 | 0.155 |
+| Category | Pre-Phase-1 | Phase 1 | **Phase 1.1 (current)** |
+|---|---|---|---|
+| Overall | 0.208 | 0.279 | **0.371** |
+| Cat-1 (single-hop) | 0.209 | 0.170 (regressed) | **0.316** (recovered + lifted) |
+| Cat-2 (temporal) | 0.022 | 0.321 | **0.492** |
+| Cat-3 (multi-hop) | 0.228 | 0.272 | **0.326** |
+| Cat-4 (knowledge update) | 0.316 | 0.366 | **0.473** |
+| Cat-5 (adversarial) | 0.135 | 0.155 | 0.135 (within noise) |
 
-**Cat-2 has a structural ceiling around 0.60** — ~22% of LoCoMo cat-2 questions have non-date gold answers (mis-categorized as cat-2 in the dataset) that no temporal fix can address.
+**Cat-2 has a structural ceiling around 0.60** — ~22% of LoCoMo cat-2 questions have non-date gold answers (mis-categorized as cat-2 in the dataset) that no temporal fix can address. Phase 1.1's 0.492 puts the system at ~82% of that ceiling.
 
 ---
 
-## Short-term workstream (Phase 1 consolidation, ~2 days)
+## Short-term workstream (Phase 1 consolidation, ~agent 1-2 hr active)
 
 In execution order:
 
 | # | Item | Effort | Why this order |
 |---|---|---|---|
-| 1 | **Cat-1 regression investigation** | ~½ day | Phase 1's anchor line added context that's irrelevant for atemporal facts and cost cat-1 −3.9pp. Need root cause before deciding Phase 2 — is the anchor specifically hurting, or is the prompt too long now, or something else? |
-| 2 | **Phase 2 re-scope decision** | ~½ day | Original projection: cat-2 → 0.40-0.55 from L1+L2 combined. Phase 1 alone hit 0.321; remaining gap is "mode C" (events dropped during session condensation) which `event_when` doesn't directly address. Decide: ship event_when anyway, do a smaller prompt-only event-coverage rev (folded L4), or move on to higher-leverage work. Settled spec for L2 lives in CAT2_TEMPORAL.md if pursued. |
-| 3 | **Promote `/tmp/l1_microbench.py` → `benchmarks/bench_temporal_arithmetic.py`** | ~½ day | Permanent guardrail against future extraction-prompt regressions on LLM date arithmetic. Cheap insurance. |
-| 4 | **Memory injection filter: pre-filter legacy data** | ~½ day | One-time scan of facts/entities/summaries stored before April 2026, run each through `memory_filter_check()`. Closes the only known filter coverage gap. Low priority but easy. |
+| 1 | ~~**Cat-1 regression investigation**~~ | DONE | Phase 1.1 fixed it — root cause was subject-name elision from over-broad "preserve original phrase" instruction. Patched prompt + folded in production cache-invalidate fix. Cat-1 recovered to **+10.7pp over original baseline**. |
+| 2 | **Phase 2 re-scope decision** | agent ~30m · 1 ckpt | Original projection: cat-2 → 0.40-0.55 from L1+L2 combined. Phase 1.1 alone hit **0.492** without a schema change. Decide: skip event_when entirely (highest-leverage work is now elsewhere), or pursue a much smaller prompt-only event-coverage rev for the residual "mode C" (events dropped during session condensation). Settled L2 spec lives in CAT2_TEMPORAL.md if pursued. |
+| 3 | **Promote `/tmp/l1_microbench.py` → `benchmarks/bench_temporal_arithmetic.py`** | agent ~30m · 1 ckpt | Permanent guardrail against future extraction-prompt regressions on LLM date arithmetic. Cheap insurance. |
+| 4 | **Memory injection filter: pre-filter legacy data** | agent ~30m · 1 ckpt | One-time scan of facts/entities/summaries stored before April 2026, run each through `memory_filter_check()`. Closes the only known filter coverage gap. Low priority but easy. |
 
 ---
 
