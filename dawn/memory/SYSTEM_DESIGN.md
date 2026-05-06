@@ -559,44 +559,64 @@ For 1,000 document chunks: ~1.5 MB of vector data (trivial)
 
 ## 6. Storage Schema
 
-Using SQLite (already a DAWN dependency for auth).
+Using SQLite (already a DAWN dependency for auth). Current schema version: **v42**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
+
+Convention notes:
+- All `created_at` / `last_accessed` / `first_seen` / `last_seen` / `valid_from` / `valid_to` columns are **`INTEGER` Unix epoch seconds**, not SQL `TIMESTAMP`. Defaults are `(strftime('%s','now'))`.
+- All foreign keys to `users(id)` cascade on user delete. Schema text below shows the live database shape; the migration history adds columns one at a time, so column ordering reflects insert-history rather than logical grouping.
+- All "source_*" provenance columns (added v40 / extended v42 in Phase B) point back into `conversations` / `messages` so retrieval can render the original utterance — see [PROVENANCE.md](PROVENANCE.md).
 
 ### 6.1 Memory Facts Table
 
 ```sql
 CREATE TABLE memory_facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    fact_text TEXT NOT NULL,           -- "User is allergic to shellfish"
+    user_id INTEGER NOT NULL,
+    fact_text TEXT NOT NULL,            -- "User is allergic to shellfish"
     confidence REAL DEFAULT 1.0,        -- 0.0-1.0
     source TEXT DEFAULT 'inferred',     -- 'explicit', 'inferred'
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_accessed TIMESTAMP,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_accessed INTEGER,
     access_count INTEGER DEFAULT 0,
     superseded_by INTEGER,              -- FK to newer fact if corrected
-    embedding BLOB,                     -- 384 floats for semantic search (optional)
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    FOREIGN KEY (superseded_by) REFERENCES memory_facts(id)
+    normalized_hash INTEGER DEFAULT 0,  -- FNV-1a hash for fast dup detection
+    embedding BLOB DEFAULT NULL,        -- bge-small-en-v1.5-int8 dim, see §3.5
+    embedding_norm REAL DEFAULT NULL,   -- pre-computed L2 norm
+    category TEXT NOT NULL DEFAULT 'general',  -- v34 — 8-label taxonomy, see §6.1.1
+    source_conversation_id INTEGER DEFAULT NULL,  -- v40 provenance triple
+    source_msg_id_start    INTEGER DEFAULT NULL,
+    source_msg_id_end      INTEGER DEFAULT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by) REFERENCES memory_facts(id) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_memory_facts_user ON memory_facts(user_id);
-CREATE INDEX idx_memory_facts_confidence ON memory_facts(user_id, confidence DESC);
+CREATE INDEX idx_memory_facts_user           ON memory_facts(user_id);
+CREATE INDEX idx_memory_facts_confidence     ON memory_facts(user_id, confidence DESC);
+CREATE INDEX idx_memory_facts_hash           ON memory_facts(user_id, normalized_hash);
+CREATE INDEX idx_memory_facts_user_category  ON memory_facts(user_id, category);
 ```
+
+#### 6.1.1 Fact category taxonomy (v34)
+
+`category` is one of 8 fixed labels — `personal` / `professional` / `relationships` / `health` / `interests` / `practical` / `preferences` / `general` — defined as a single source of truth in `include/memory/memory_types.h` (`MEMORY_FACT_CATEGORIES[]` + `MEMORY_FACT_CATEGORY_COUNT`). Validated in C; unknown labels are coerced to `general`. Pre-filtered at the SQL level via `memory_db_fact_search_by_category()` so hybrid scoring only sees the right slice when the LLM passes `category` to the search tool.
 
 ### 6.2 Memory Preferences Table
 
 ```sql
 CREATE TABLE memory_preferences (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
     category TEXT NOT NULL,             -- 'verbosity', 'humor', 'formality', 'detail_level'
     value TEXT NOT NULL,                -- "prefers concise responses"
     confidence REAL DEFAULT 0.5,
     source TEXT DEFAULT 'inferred',     -- 'explicit', 'inferred'
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     reinforcement_count INTEGER DEFAULT 1,
-    FOREIGN KEY (user_id) REFERENCES users(id),
+    source_conversation_id INTEGER DEFAULT NULL,  -- v42 — Phase B provenance
+    source_msg_id_start    INTEGER DEFAULT NULL,
+    source_msg_id_end      INTEGER DEFAULT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     UNIQUE(user_id, category)
 );
 ```
@@ -606,16 +626,19 @@ CREATE TABLE memory_preferences (
 ```sql
 CREATE TABLE memory_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
     session_id TEXT NOT NULL,
     summary TEXT NOT NULL,              -- "Discussed home automation setup..."
-    topics TEXT,                        -- JSON array: ["home automation", "mqtt"]
+    topics TEXT,                        -- JSON array or comma-joined: "home automation, mqtt"
     sentiment TEXT,                     -- 'positive', 'neutral', 'frustrated'
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     message_count INTEGER,
     duration_seconds INTEGER,
-    consolidated BOOLEAN DEFAULT FALSE,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    consolidated INTEGER DEFAULT 0,
+    source_conversation_id INTEGER DEFAULT NULL,  -- v42 — Phase B provenance
+    source_msg_id_start    INTEGER DEFAULT NULL,
+    source_msg_id_end      INTEGER DEFAULT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_memory_summaries_user ON memory_summaries(user_id, created_at DESC);
@@ -630,14 +653,17 @@ CREATE TABLE memory_entities (
     name TEXT NOT NULL,                 -- Display name (e.g., "Kris Kersey")
     entity_type TEXT NOT NULL,          -- "person", "place", "pet", "project", "thing"
     canonical_name TEXT NOT NULL,       -- Lowercase normalized (e.g., "kris kersey")
+    embedding BLOB DEFAULT NULL,        -- Float array for semantic search
+    embedding_norm REAL DEFAULT NULL,   -- Pre-computed L2 norm
+    first_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_seen INTEGER,
     mention_count INTEGER DEFAULT 1,
-    first_seen INTEGER NOT NULL,        -- Unix timestamp
-    last_seen INTEGER NOT NULL,         -- Unix timestamp
-    embedding BLOB,                     -- Float array for semantic search
-    embedding_norm REAL,                -- Pre-computed L2 norm
-    FOREIGN KEY (user_id) REFERENCES users(id),
+    photo_id TEXT DEFAULT NULL,         -- Image-store id for the entity portrait
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     UNIQUE(user_id, canonical_name)
 );
+
+CREATE INDEX idx_memory_entities_user ON memory_entities(user_id);
 ```
 
 ### 6.5 Memory Relations Table
@@ -651,51 +677,140 @@ CREATE TABLE memory_relations (
     object_entity_id INTEGER,           -- FK to entity (NULL if literal value)
     object_value TEXT,                  -- Literal value (e.g., "golden retriever")
     fact_id INTEGER,                    -- Optional FK to originating fact
-    confidence REAL DEFAULT 1.0,
+    confidence REAL DEFAULT 0.8,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    valid_from INTEGER DEFAULT NULL,    -- v33 — bitemporal validity (NULL = open)
+    valid_to   INTEGER DEFAULT NULL,
+    source_conversation_id INTEGER DEFAULT NULL,  -- v42 — Phase B provenance
+    source_msg_id_start    INTEGER DEFAULT NULL,
+    source_msg_id_end      INTEGER DEFAULT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (object_entity_id) REFERENCES memory_entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (fact_id) REFERENCES memory_facts(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_memory_relations_subject       ON memory_relations(subject_entity_id);
+CREATE INDEX idx_memory_relations_object        ON memory_relations(object_entity_id);
+CREATE INDEX idx_memory_relations_user          ON memory_relations(user_id);
+CREATE INDEX idx_memory_relations_user_validity ON memory_relations(user_id, valid_to);
+CREATE INDEX idx_memory_relations_subject_open  ON memory_relations(subject_entity_id, relation)
+   WHERE valid_to IS NULL;
+```
+
+The partial `idx_memory_relations_subject_open` index keeps the auto-close path (`memory_db_relation_supersede` — see §11 / S8) cheap: only currently-open relations are indexed.
+
+### 6.6 Conversations (anchor for cat-2 temporal extraction)
+
+```sql
+CREATE TABLE conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT 'New Conversation',
     created_at INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id),
-    FOREIGN KEY (object_entity_id) REFERENCES memory_entities(id),
-    FOREIGN KEY (fact_id) REFERENCES memory_facts(id)
+    updated_at INTEGER NOT NULL,
+    message_count INTEGER DEFAULT 0,
+    is_archived INTEGER DEFAULT 0,
+    -- ... omitted: webui-only / compaction / per-conversation LLM config columns ...
+    last_extracted_msg_count INTEGER DEFAULT 0,
+    last_extracted_msg_id    INTEGER NOT NULL DEFAULT 0,  -- v41 — ID-based extraction cursor
+    extraction_attempts          INTEGER DEFAULT 0,        -- v39 — recovery worker
+    extraction_last_attempt_at   INTEGER DEFAULT 0,
+    is_private INTEGER DEFAULT 0,
+    anchor_date INTEGER NOT NULL DEFAULT 0,                -- v42 — Cat-2 Phase 1
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
-
-CREATE INDEX idx_memory_relations_subject ON memory_relations(user_id, subject_entity_id);
-CREATE INDEX idx_memory_relations_object ON memory_relations(user_id, object_entity_id);
 ```
 
-### 6.6 RAG Documents Table
+`anchor_date` is the conversation's logical "now" — production writers populate it with `time(NULL)` at insert; the bench harness overrides it per LoCoMo session. The extraction prompt prepends `Conversation anchor: YYYY-MM-DD` so the LLM can resolve relative phrases ("yesterday", "last month") against it. See [CAT2_TEMPORAL.md](CAT2_TEMPORAL.md).
+
+### 6.7 Summary nodes (hierarchical compaction DAG)
 
 ```sql
-CREATE TABLE rag_documents (
+CREATE TABLE summary_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path TEXT NOT NULL UNIQUE,
-    file_name TEXT NOT NULL,
-    file_type TEXT NOT NULL,            -- 'txt', 'md', 'pdf', 'docx'
+    conversation_id INTEGER NOT NULL,
+    prior_node_id INTEGER,                          -- linked-list backbone
+    depth INTEGER NOT NULL DEFAULT 0,
+    msg_id_start INTEGER NOT NULL,
+    msg_id_end   INTEGER NOT NULL,
+    level INTEGER NOT NULL DEFAULT 0,               -- 0=raw window, >0=meta-summary
+    summary_text TEXT NOT NULL,
+    token_count INTEGER,
+    created_at INTEGER,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (prior_node_id) REFERENCES summary_nodes(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_summary_nodes_conv ON summary_nodes(conversation_id);
+```
+
+Backs the LCM Phase-4 lossless-pointer system: `[COMPACTED conv=N msgs=X-Y node=Z depth=D]` tags reference a `summary_nodes` row, and `context_expand` walks the chain to retrieve original messages by ID range.
+
+### 6.8 System metadata
+
+```sql
+CREATE TABLE system_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
+
+Daemon-wide key/value store. Used by the embedding-recompute worker to record `embedding_model_id` (current production embedder) — when the value changes, `users.embeddings_model_id` is compared per-user and out-of-date users are re-embedded in the background. See [EMBEDDING_UPGRADE.md](EMBEDDING_UPGRADE.md).
+
+### 6.9 Users (memory-relevant columns)
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    is_admin INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_login INTEGER,
+    failed_attempts INTEGER DEFAULT 0,
+    lockout_until INTEGER DEFAULT 0,
+    categories_backfilled_at INTEGER DEFAULT 0,    -- v34 — fact-category backfill marker
+    embeddings_model_id      TEXT DEFAULT NULL     -- v41 — last completed re-embed model
+);
+```
+
+Memory-related columns only. The admin/auth columns are documented under the auth subsystem.
+
+### 6.10 Document chunks (RAG)
+
+```sql
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,                    -- per-user storage; NULL allowed for is_global=1
+    filename TEXT NOT NULL,
+    filepath TEXT NOT NULL,
+    filetype TEXT NOT NULL,             -- 'txt', 'md', 'pdf', 'docx'
     file_hash TEXT NOT NULL,            -- SHA256 for change detection
-    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    chunk_count INTEGER DEFAULT 0
+    num_chunks INTEGER NOT NULL,
+    is_global INTEGER DEFAULT 0,        -- 1 = shared across users
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
-```
 
-### 6.7 RAG Chunks Table
+CREATE INDEX idx_documents_user ON documents(user_id);
+CREATE INDEX idx_documents_hash ON documents(file_hash);
 
-```sql
-CREATE TABLE rag_chunks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE document_chunks (
+    id INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL,
     chunk_index INTEGER NOT NULL,       -- Order within document
-    chunk_text TEXT NOT NULL,
-    embedding BLOB NOT NULL,            -- 384 floats
-    token_count INTEGER,
-    FOREIGN KEY (document_id) REFERENCES rag_documents(id) ON DELETE CASCADE
+    text TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    embedding_norm REAL NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0,  -- v37 — backfilled from parent.created_at
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_rag_chunks_document ON rag_chunks(document_id);
+CREATE INDEX idx_doc_chunks_doc ON document_chunks(document_id);
 ```
 
-**Shared Documents Model:** RAG documents are shared across all users - this is household-level knowledge (manuals, recipes, reference docs). Admin manages files manually via SSH/SFTP. No per-user isolation in v1.
-
-**Future Enhancement:** Per-user document storage with WebUI file upload (see Phase 12+).
+`document_chunks.created_at` powers the same temporal-query proximity scoring that facts use — see §7.2 / temporal-weight tuning. `is_global=1` documents are visible to every authenticated user; per-user uploads default to `is_global=0`.
 
 ---
 
@@ -921,7 +1036,7 @@ Handles questions like:
 - "What did I tell you about my car?"
 - "Do you remember my daughter's name?"
 - "What did we talk about last Thursday?"
-- "What did we decide about the garage?"
+- "Where did Caroline work in 2020?"
 
 **Tool Definition:**
 
@@ -929,94 +1044,72 @@ Handles questions like:
 { "device": "memory", "action": "search", "value": "daughter name" }
 ```
 
-**With optional date filtering:**
+**With optional filters:**
 
 ```json
-{ "device": "memory", "action": "search", "value": "garage", "date": "2026-01-16" }
+{ "device": "memory", "action": "search", "value": "garage", "time_range": "30d" }
 ```
 
 ```json
-{
-   "device": "memory",
-   "action": "search",
-   "value": "",
-   "date_from": "2026-01-13",
-   "date_to": "2026-01-17"
-}
+{ "device": "memory", "action": "search", "value": "diet",
+  "category": "health", "with_source": "true" }
 ```
 
-**Parameters:**
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `value` | Yes | Keywords to search (can be empty if using date filter) |
-| `date` | No | Specific date (YYYY-MM-DD) |
-| `date_from` | No | Start of date range |
-| `date_to` | No | End of date range |
+```json
+{ "device": "memory", "action": "search", "value": "Caroline employer",
+  "as_of": "2020-06-01", "include_historical": "true" }
+```
 
-The LLM translates natural language ("last Thursday") to date parameters.
+**Parameters** (parsed in `src/memory/memory_callback.c:1044` `memoryCallback("search")` and forwarded to `memory_action_search`):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value` | string | Keywords to search (small tokens, not full sentences). May be empty when paired with `time_range` for time-based discovery. |
+| `time_range` | string | Window like `"24h"` / `"7d"` / `"1w"`; restricts both fact `created_at` and summary recency. Parsed by `parse_time_period()`. |
+| `category` | enum | One of the 8 fact categories (see §6.1.1). Pre-filters fact set at SQL level via `memory_db_fact_search_by_category()`. Unknown labels are logged and ignored. |
+| `as_of` | ISO-8601 date | Evaluates relation validity at a historical point. Accepts `YYYY-MM-DD` or bare `YYYY` (= Jan 1). Parsed by `strptime` + `timegm`. |
+| `include_historical` | "true" / "false" | When `true`, the entity-recall path bypasses the open-relation filter and returns superseded relations too. Default `false`. |
+| `with_source` | "true" / "false" | When `true`, retrieved items append a verbatim source excerpt drawn from the original conversation, deduped within the call and budget-bounded by `[memory] source_budget_chars` from `dawn.toml`. Default `false`. See [PROVENANCE.md](PROVENANCE.md). |
+
+The LLM translates natural language to these parameters: "last Thursday" → `time_range`, "back when she worked at X" → `as_of`, "what did Caroline used to do" → `include_historical=true`. The legacy `date` / `date_from` / `date_to` parameters from earlier revisions of this doc were never wired to production — they did not survive the time_range / as_of consolidation.
 
 **Design Principles:**
 
-- **Unified search**: Single tool searches across facts, preferences, and summaries
-- **Keyword-based**: Search value should be small keywords, not full sentences
-- **Date-aware**: Can filter by date for "when did we discuss X?" queries
-- **LLM interprets results**: Return matching items, let the LLM sort out relevance
+- **Unified search**: One tool searches facts, preferences, summaries, and the entity graph in a single call.
+- **Keyword-light + structured filters**: `value` carries the lexical signal; `category` / `time_range` / `as_of` carry structure that hybrid scoring can't extract from natural language reliably.
+- **Bitemporal correctness**: `as_of` + `include_historical` let the LLM ask "who did X work for in 2020" without contaminating present-tense queries.
+- **Provenance optional, never default**: `with_source` is opt-in because verbatim excerpts are token-expensive; the response without `with_source` is what the original LongMemEval / LoCoMo runs measure.
+- **Strbuf-based output**: The action assembles the response in a growable `strbuf_t` (`include/core/strbuf.h`) — no fixed 8 KB ceiling, sticky-OOM, max 256 KiB. Earlier fixed-buffer versions silently truncated when `with_source` budgets exceeded ~3 KB; see [PROVENANCE.md](PROVENANCE.md) §"Strbuf truncation fix."
 
-**Search Implementation:**
+**Search Strategy** (current implementation, after the v41 hybrid-scoring + temporal-query work):
 
-```c
-typedef struct {
-   const char *keywords;      // Can be empty
-   const char *date;          // NULL or "YYYY-MM-DD"
-   const char *date_from;     // NULL or "YYYY-MM-DD"
-   const char *date_to;       // NULL or "YYYY-MM-DD"
-} memory_search_params_t;
+1. If `category` is set, pre-filter the candidate fact ID set via SQL `WHERE category = ?` index.
+2. Otherwise, hybrid score: cosine similarity (bge-small-en-v1.5-int8 — see §3.5 / [EMBEDDING_UPGRADE.md](EMBEDDING_UPGRADE.md)) + keyword overlap + temporal-query proximity (when the query contains a temporal expression — `src/core/time_query_parser.c`) + proper-noun boost.
+3. Apply `time_range` window if set (also applied to summaries).
+4. For each top-K matching fact, look up entity links and currently-valid relations (or historical, if `include_historical`).
+5. If `with_source`, batch-fetch provenance via the four sibling readers in `memory_db_provenance.h`: `memory_db_facts_get_sources`, `memory_db_relations_get_sources`, `memory_db_summaries_get_sources`, `memory_db_prefs_get_sources`. Each returns parallel `conv_id` / `msg_id_start` / `msg_id_end` arrays for any positive N (auto-chunked at 32 IDs per SQL pass). Verbatim excerpts append up to the per-call `source_budget_chars` limit.
 
-typedef struct {
-   memory_fact_t *facts;
-   int fact_count;
-   memory_preference_t *preferences;
-   int preference_count;
-   memory_summary_t *summaries;
-   int summary_count;
-} memory_search_result_t;
+**Search Response Format** (text, not JSON — the LLM reads it directly):
 
-// Search across all memory tables with optional date filtering
-memory_search_result_t *memory_search(const char *user_id, const memory_search_params_t *params);
+```
+FACTS:
+- [ID:42] User's daughter is named Emma (explicit, 2026-01-10)
+- [ID:118] Decided to use Zigbee for garage automation (inferred, 2026-01-16)
+  ┌── source [conv 7, msgs 14-16] ────────────────────────────
+  │ user: "let's go with zigbee for the garage"
+  │ assistant: "noted — switching the project to zigbee"
+  └────────────────────────────────────────────────────────────
+
+ENTITIES:
+- Emma (person) — daughter_of Kris
+- Garage (place) — has_protocol zigbee (since 2026-01-16)
+
+RECENT CONVERSATIONS:
+- [3 hours ago] Discussed garage automation...
+  Topics: home automation, zigbee
 ```
 
-**Search Strategy:**
-
-1. Tokenize keywords (split on spaces) - skip if empty
-2. Search `memory_facts.fact_text` for keyword matches (LIKE '%keyword%')
-3. Search `memory_preferences.value` for keyword matches
-4. Search `memory_summaries.summary` and `memory_summaries.topics` for keyword matches
-5. Apply date filter to summaries (and facts if `created_at` matches)
-6. Optionally: Use embeddings for semantic search if keyword search returns few results
-7. Return top N results from each category, sorted by relevance/confidence/date
-
-**Search Response Format:**
-
-```json
-{
-   "facts": [
-      { "text": "User's daughter is named Emma", "confidence": 0.95, "created": "2026-01-10" },
-      {
-         "text": "Decided to use Zigbee for garage automation",
-         "confidence": 0.9,
-         "created": "2026-01-16"
-      }
-   ],
-   "preferences": [],
-   "summaries": [
-      {
-         "summary": "Discussed garage automation. Decided Zigbee over Z-Wave for better range.",
-         "date": "2026-01-16",
-         "topics": ["home automation", "zigbee"]
-      }
-   ]
-}
-```
+The text format is canonical because the model is reading it as system input — JSON would force a parse step on the model side without buying anything. Full grammar in `memory_action_search()` and `memory_action_recent()`.
 
 #### 9.1.2 Remember Action
 
@@ -1649,61 +1742,101 @@ Phases 7-11 were implemented as a separate subsystem documented in `docs/RAG_DES
 
 ## 12. File Structure
 
+Cross-checked against `ls src/memory/` and `ls include/memory/` at schema v42 (May 2026). New modules from the May 2026 ship-velocity (recovery, recategorize, embed-recompute, filter, provenance, source-dedup) are listed inline below.
+
 ```
 include/memory/
-├── memory_db.h            # CRUD for facts, prefs, summaries, entities, relations, entity merge
-├── memory_embeddings.h    # Semantic embedding API (multi-provider, hybrid search)
-├── memory_context.h       # Context building for LLM system prompt
-├── memory_maintenance.h   # Nightly decay orchestration API
-├── memory_similarity.h    # Duplicate detection API (normalize, hash, Jaccard)
-├── memory_types.h         # Data structures (fact, pref, summary, entity, relation)
-└── contacts_db.h          # Contact CRUD API (find, add, update, delete, list)
+├── memory_db.h                # CRUD for facts, prefs, summaries, entities, relations
+├── memory_db_provenance.h     # Phase B — source-linked recall batch readers
+├── memory_embeddings.h        # Semantic embedding API (multi-provider, hybrid search)
+├── memory_embed_recompute.h   # Background re-embed worker (model_id mismatch)
+├── memory_embed_tokenizer.h   # Shared WordPiece tokenizer (extracted from ONNX provider)
+├── memory_extraction.h        # Sleep-consolidation extraction entry points
+├── memory_filter.h            # Injection-pattern blocklist (~118 patterns + Unicode normalize)
+├── memory_context.h           # Context building for LLM system prompt
+├── memory_maintenance.h       # Nightly decay orchestration API
+├── memory_recategorize.h      # LLM-based fact-category recategorize admin path
+├── memory_recovery.h          # Crash-recovery worker for unconsolidated sessions
+├── memory_similarity.h        # Duplicate detection API (normalize, hash, Jaccard)
+├── memory_types.h             # Data structures (fact, pref, summary, entity, relation,
+│                              #   provenance triple, fact-category taxonomy)
+├── memory_callback_internal.h # Internal types shared by memory_callback.c + provenance
+└── contacts_db.h              # Contact CRUD API (find, add, update, delete, list)
 
 include/core/
-└── embedding_engine.h     # Shared embedding API (ONNX, Ollama, OpenAI providers)
+├── embedding_engine.h         # Shared embedding API (ONNX, Ollama, OpenAI providers)
+├── time_query_parser.h        # Recognizes temporal expressions in queries
+├── iso8601.h                  # Canonical ISO 8601 parsing (consolidated April 2026)
+└── strbuf.h                   # Growable string buffer used for memory tool output
 
 include/tools/
-├── document_db.h          # Document/chunk CRUD (RAG storage layer)
-├── document_chunker.h     # Text chunking for embedding
-├── document_search.h      # RAG semantic search tool
-├── document_extract.h     # PDF/DOCX/HTML text extraction
+├── document_db.h              # Document/chunk CRUD (RAG storage layer)
+├── document_chunker.h         # Text chunking for embedding
+├── document_search.h          # RAG semantic search tool
+├── document_extract.h         # PDF/DOCX/HTML text extraction
 └── document_index_pipeline.h  # Shared indexing pipeline (chunk, embed, store)
 
 src/memory/
-├── memory_db.c            # SQLite CRUD, entity upsert, relation create, entity merge
-├── memory_embeddings.c    # Embedding cache, hybrid search, cache invalidation
-├── memory_embed_ollama.c  # Ollama embedding provider (/api/embed endpoint)
-├── memory_embed_openai.c  # OpenAI embedding provider (/v1/embeddings endpoint)
-├── memory_embed_onnx.c    # ONNX Runtime embedding provider (local, WordPiece tokenizer)
-├── memory_context.c       # Context building for LLM system prompt
-├── memory_callback.c      # LLM tool callback (9 actions: search/remember/forget/recent + contacts + merge)
-├── memory_extraction.c    # LLM-based extraction: facts, prefs, entities, relations (threaded)
-├── memory_maintenance.c   # Nightly decay orchestration
-├── memory_similarity.c    # Duplicate detection (Jaccard, FNV-1a hashing)
-└── contacts_db.c          # Contact CRUD (find, add, update, delete, list)
+├── memory_db.c                # SQLite CRUD, entity upsert, relation create, entity merge,
+│                              #   contradiction detection (EXCLUSIVE_RELATIONS[],
+│                              #   CONTRADICTORY_PAIRS[], memory_db_relation_supersede)
+├── memory_db_provenance.c     # Phase B — moved out of memory_db.c (line-budget); 4 batch
+│                              #   source readers + privacy JOIN, auto-chunked at 32 IDs
+├── memory_embeddings.c        # Embedding cache, hybrid search, cache invalidation
+├── memory_embed_ollama.c      # Ollama embedding provider (/api/embed endpoint)
+├── memory_embed_openai.c      # OpenAI embedding provider (/v1/embeddings endpoint)
+├── memory_embed_onnx.c        # ONNX Runtime embedding provider (local)
+├── memory_embed_recompute.c   # Background re-embed worker, schema v41 + system_metadata
+├── memory_embed_tokenizer.c   # WordPiece tokenizer shared with reranker investigation
+├── memory_context.c           # Context building for LLM system prompt
+├── memory_callback.c          # LLM tool callback dispatcher (search / remember / forget /
+│                              #   recent + 4 contact actions + entity merge)
+├── memory_extraction.c        # LLM-based extraction: facts, prefs, entities, relations,
+│                              #   summaries, topics; subject-naming + anchor-aware prompt
+├── memory_filter.c            # Injection-pattern blocklist + Unicode normalization
+├── memory_maintenance.c       # Nightly decay orchestration
+├── memory_recategorize.c      # Per-fact LLM recategorization admin command
+├── memory_recovery.c          # Crash-recovery worker (idle 1h, 24h scan, 5-min timeout)
+├── memory_similarity.c        # Duplicate detection (Jaccard, FNV-1a hashing)
+├── memory_source_dedup.c      # source_dedup_set_t — suppresses re-fetched provenance
+└── contacts_db.c              # Contact CRUD (find, add, update, delete, list)
+
+src/core/
+├── embedding_engine.c         # Provider-agnostic embedding + vector math
+├── time_query_parser.c        # Layer 1 temporal-expression recognizer
+├── iso8601.c                  # Canonical ISO 8601 parsing
+└── strbuf.c                   # Growable string buffer (256 KiB cap, sticky-OOM)
+
+src/tools/
+├── document_db.c              # SQLite CRUD for documents and chunks
+├── document_chunker.c         # Paragraph/sentence splitting with configurable overlap
+├── document_search.c          # RAG search: cosine + keyword + temporal-proximity
+├── document_extract.c         # PDF (MuPDF), DOCX (libzip+libxml2), HTML, plain text
+├── document_index_tool.c      # LLM tool for URL-based document ingestion
+└── document_index_pipeline.c  # SHA-256 dedup, chunking, embedding, DB storage
 
 src/webui/
-├── webui_memory.c         # WebUI memory endpoints (list, delete, stats, entities)
+├── webui_memory.c             # WebUI memory endpoints (list, delete, stats, entities,
+│                              #   import/export with filter pre-pass)
 └── ...
 
 www/js/ui/
-├── memory.js              # Memory viewer UI (tabs, search, entity graph, delete)
+├── memory.js                  # Memory viewer UI (tabs, search, entity graph, delete)
 └── ...
 
 www/css/components/
-├── memory.css             # Memory viewer styles (entity badges, relations, tabs)
+├── memory.css                 # Memory viewer styles (entity badges, relations, tabs)
 └── ...
 
-src/core/
-└── embedding_engine.c     # Provider-agnostic embedding + vector math (shared by memory + RAG)
+benchmarks/
+├── bench_retrieval.c          # C-side retrieval scoring driver (LongMemEval/LoCoMo/ConvoMem)
+├── bench_memory_pipeline.c    # End-to-end extraction + retrieval bench (Phase 0+ memory mode)
+├── bench_temporal_arithmetic.py  # Cat-2 temporal-arithmetic LLM guardrail (May 2026)
+├── run_benchmark.py           # Orchestrator
+└── ...
 
-src/tools/
-├── document_db.c          # SQLite CRUD for documents and chunks
-├── document_chunker.c     # Paragraph/sentence splitting with configurable overlap
-├── document_search.c      # RAG search: cosine similarity + keyword boosting
-├── document_extract.c     # PDF (MuPDF), DOCX (libzip+libxml2), HTML, plain text
-├── document_index_tool.c  # LLM tool for URL-based document ingestion
-└── document_index_pipeline.c  # SHA-256 dedup, chunking, embedding, DB storage
+scripts/
+└── scan_legacy_memory_filter.c   # One-time legacy-data scanner against memory_filter_check
 ```
 
 ---
