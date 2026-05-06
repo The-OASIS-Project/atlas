@@ -1,8 +1,55 @@
-# Provenance — Phase A Validation Result + Phase B Plan
+# Provenance — Phase A + Phase B As-Shipped Record
 
-**Status:** Phase A SHIPPED 2026-05-06.  Bench-validated overall `recall_generation` lift +12.51pp at budget=12288 (0.368 → 0.493) on LoCoMo.  Phase B (coverage extension) GREEN-LIT, deferred to next implementation cycle.  This doc is the as-shipped record for Phase A and the spec for Phase B.
+**Status:** Phase A SHIPPED 2026-05-06 (morning); Phase B SHIPPED 2026-05-06 (afternoon).  Phase A bench-validated overall `recall_generation` lift +12.51pp at budget=12288 (0.368 → 0.493) on LoCoMo.  Phase B extended coverage from facts-only to all four record types (facts + relations + summaries + preferences); bench-validated as non-regressing (Phase A and Phase B binaries produce identical recall_generation 0.294 / 0.296 on full 10-conv LoCoMo).  This doc is the as-shipped record.
 
 **Date:** 2026-05-06.
+
+## Phase B — Final Result
+
+| Metric | Phase A binary today | Phase B binary today | Δ |
+|---|---:|---:|---:|
+| recall_reach | 0.7392 | 0.7392 | 0.00pp |
+| recall_entailment | 0.2568 | 0.2568 | 0.00pp |
+| recall_generation overall | 0.2941 | 0.2957 | +0.16pp (noise) |
+| cat-1 single-hop | 0.248 | 0.248 | 0.00pp |
+| cat-2 temporal | 0.019 | 0.019 | 0.00pp |
+| cat-3 multi-hop | 0.272 | 0.261 | −1.1pp (within run-to-run noise) |
+| cat-4 knowledge update | 0.502 | 0.504 | +0.2pp |
+| cat-5 adversarial | 0.135 | 0.139 | +0.4pp |
+
+Both runs at default budget=3072, same 10-conv LoCoMo, same orchestrator (today's `run_benchmark.py` HEAD).  Phase B is non-regressing — the small deltas are within measurement noise (one transient SSL handshake timeout in Phase A's run produced 1 empty answer; otherwise 99%+ generator cache overlap between the two binaries).
+
+### Important caveat: orchestrator-version drift
+
+The May 4 Phase A pass1b numbers (`recall_generation 0.4450, recall_reach 0.8342` at budget=3072) are **NOT REPRODUCIBLE TODAY** with either binary.  Both Phase A and Phase B binaries running today's orchestrator produce ~0.294 / ~0.739 at the same budget.  The drift is from `run_benchmark.py` changes between May 4 and today — most likely commit `b6ffd11` (Cat-2 anchor injection, May 5) which added bench-side anchor plumbing — and possibly other follow-ups.  Bench numbers from that May 4 run should not be carried forward as a comparison baseline; the new today-baseline is `recall_generation 0.294 / recall_reach 0.739` at budget=3072.
+
+This drift was discovered while diagnosing what initially looked like a Phase B regression.  Resolution: re-ran Phase A binary against today's orchestrator on (a) conv 0 only with full pipeline, (b) all 10 convs with full pipeline.  Both produced numbers identical to Phase B's, settling the question.  Item #6 of STATE.md's short-term workstream tracks the follow-up to pinpoint which commit moved the numbers and update SYSTEM_DESIGN.md tables accordingly.
+
+## Phase B — What Was Shipped
+
+| Component | File(s) |
+|---|---|
+| New module: provenance readers | `include/memory/memory_db_provenance.h`, `src/memory/memory_db_provenance.c` |
+| Moved out of `memory_db.c` (over the 1500-line soft limit) | `memory_db_fact_get_source`, `memory_db_facts_get_sources` |
+| Three new sibling batch readers | `memory_db_relations_get_sources`, `memory_db_summaries_get_sources`, `memory_db_prefs_get_sources` — one shared `batch_get_sources` helper with privacy JOIN; all four wrappers literal-string table names only |
+| `MAX_PROVENANCE_BATCH = 32` cap with `_Static_assert` tying it to a 1024-byte SQL buffer | `memory_db_provenance.c` |
+| Auto-chunking on public surface | All four `_get_sources` functions accept any positive N; slice into `MAX_PROVENANCE_BATCH`-sized passes internally with one DB lock cycle per chunk.  Inner builder retains fail-closed truncation as defense-in-depth. |
+| Defense-in-depth privacy filter | `bool include_private` parameter on `conv_db_get_messages_by_range`.  Memory + WebUI callers pass `false` (private rows now SQL-suppressed via `AND c.is_private = 0` JOIN).  `context_expand_tool` is the only `true` caller — user expanding own [COMPACTED] block in their own session. |
+| Range-generic source renderer | `append_source_excerpt_from_range` core renderer in `memory_callback.c` (replaces fact-specific `append_source_excerpt`).  Source rendering extended to facts + relations + summaries + preferences in BOTH `memory_action_search` and `memory_action_recent`.  `append_graph_context` signature gained `with_source` / `source_budget` / `seen` params for relation source-rendering. |
+| Source-fetch dedup | `source_dedup_set_t` (cap 24) + `source_dedup_seen` / `source_dedup_add` helpers exposed via `memory_callback_internal.h`; tiny dedicated `src/memory/memory_source_dedup.c` so unit tests can link them without the full callback dependency cone.  Renderer emits a one-line back-ref `[source: same as above (conv=N msgs=X-Y)]` on dedup hits instead of refetching identical messages.  M1 invariant (no private-source leak via "same as above") enforced at every call site by gating `source_dedup_add` on `*_conv[i] > 0` from the privacy-filtered batch APIs. |
+| 22 new tests (CI suite 42 → 43) | 13 batch-reader tests in `tests/test_memory_provenance.c` (roundtrip / NULL-prov-returns-zero / private-conv-filter / N=64-chunked-success per record type for relations/summaries/prefs + facts pin); 7 dedup helper tests in new `tests/test_memory_source_dedup.c` (empty / add+seen / distinct triples / capacity bound / NULL safe / 5-duplicates-count-as-1 / M1-zero-conv invariant); 2 privacy-filter integration tests in `tests/test_auth_db.c` (private-default-filtered, opt-in-returns-private). |
+
+### Three-agent post-implementation review
+
+`architecture-reviewer` / `embedded-efficiency-reviewer` / `security-auditor` ran in parallel on the diff.  **0 Critical / 2 High / 5 Medium / 8 Low.**  All HIGHs and security/embedded MEDIUMs folded into the same commit:
+
+- **HIGH-1 + HIGH-2** (architecture): `webui_memory.c:138` (`MAX_MEMORY_LIMIT=50` callers) and `bench_memory_pipeline.c:395,658` (up to 500 IDs) silently lost provenance for batches > 32 due to the original B.1 fail-closed semantics.  **Fix folded in: public `_get_sources` APIs auto-chunk** so callers can pass any N; inner SQL builder retains the cap as defense-in-depth.  Doc updated to reflect "any N accepted" contract.  Tests updated from "n=64 fails closed" to "n=64 chunked succeeds".
+- **MEDIUM** (embedded): hoisted `out_conv/start/end[8]` and `rel_ids[8]` arrays above the entity loop in `append_graph_context`; per-iteration zero-init now scoped to actual `rel_count`.
+- **MEDIUM** (architecture): added NULL guards on `append_source_excerpt_from_range` and `source_msg_callback` to match defensive style elsewhere in the module.
+- **LOW** (architecture + embedded both flagged): deleted unused single-fact `append_source_excerpt` wrapper — all production paths use the range-based form via batch fetches.
+- **LOW** (architecture): added measured-prefix-byte rationale comment near the `_Static_assert` (`277 bytes actual + 32×21 IDs + 2 closing chars = ~950 bytes against 1024-byte buffer`).
+
+Remaining LOWs (cosmetic style; pre-existing `memory_db.c` over the 2,500-line hard limit; `memory_action_search` extracted-helpers refactor) tracked in TODO.md for a follow-up pass.
 
 ## Phase A — Final Results
 
