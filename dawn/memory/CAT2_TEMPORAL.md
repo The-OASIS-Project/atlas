@@ -73,7 +73,36 @@ The over-correction on subject mentions was deliberate — v2 produces ~150% as 
 
 ## What changed in the Phase 2 calculus (post-Phase-1.1)
 
-After Phase 1 alone hit cat-2 0.321 the remaining ~10-20pp gap looked like the "mode C" event-coverage gap, which the structured `event_when` field doesn't directly address. After Phase 1.1 lifted cat-2 to 0.492 *without* changing the schema, that conclusion is even stronger — the L2 spec is settled in the section below if pursued, but the ~3-day spend should be re-justified against (a) provenance / source-linked recall, (b) speaker mis-attribution, (c) cat-3 multi-hop work, all of which are now higher-leverage than another temporal-storage refinement.
+After Phase 1 alone hit cat-2 0.321 the remaining ~10-20pp gap looked like the "mode C" event-coverage gap, which the structured `event_when` field doesn't directly address. After Phase 1.1 lifted cat-2 to 0.492 *without* changing the schema, that conclusion was even stronger — but worth a probe before fully closing Phase 2.
+
+## Phase 2 Option B probe (event-coverage prompt rev) — closed, no ship
+
+Tested L4 alone (the prompt instruction without the schema) on 2026-05-05. Added one bullet to the extraction prompt asking the LLM to emit a dedicated fact for every specific time-bounded event with the date in fact_text, explicitly forbidding condensation of distinct events into a single summarizing fact. Re-extracted all 10 LoCoMo conversations from a fresh cache (`snapshots_l1_v3`).
+
+**Result: cat-2 lifted, cat-1 regressed by an equal amount, overall a wash.**
+
+| Category | Phase 1.1 | Phase 2 Option B | Δ |
+|---|---:|---:|---:|
+| cat-1 | 0.316 | 0.287 | **−2.9pp** |
+| **cat-2 (target)** | 0.492 | **0.520** | **+2.8pp** |
+| cat-3 | 0.326 | 0.326 | 0 |
+| cat-4 | 0.473 | 0.477 | +0.4pp |
+| cat-5 | 0.135 | 0.141 | +0.6pp |
+| **Overall** | **0.371** | **0.374** | **+0.3pp** |
+
+**Mechanism**: the prompt did what it asked — fact counts grew ~5-17% per conversation (e.g., conv 3: 301 → 352 facts). Cat-2 questions found more matching event-shaped facts in the top-K. But cat-1 (atemporal factual queries) hit a top-K crowding wall: the generator's `max_facts=20` window now gets flooded with event-dated facts, squeezing out the subject-attribution facts that single-hop questions depend on. Net: cat-2 win on 321 questions ≈ cat-1 loss on 282 questions.
+
+**Decision: revert B's prompt change; skip Phase 2 (full L2 + L3 schema work).** Three reasons:
+
+1. **Net is a wash today.** B alone delivers no overall lift; the trade only justifies more spend if a follow-on can fix one side without unwinding the other.
+2. **C wouldn't fix the cat-1 trade.** C's mechanism is *ranking* (boost facts whose `event_when` matches the query's temporal expression) not *coverage*. Cat-1 queries have no temporal expression, so they receive no temporal boost — the same flooded top-20 still drowns subject-attribution facts. C compounds on cat-2 (likely +3-5pp more, toward the 0.55-0.57 range, near the 0.60 ceiling) but doesn't address the cat-1 mechanism. Best case: overall ~0.39, with cat-1 still down ~3pp. The trade still isn't justified.
+3. **Higher-leverage work is queued.** Provenance / source-linked recall, speaker mis-attribution, and the cat-3 multi-hop graph approach all promise broader category coverage and bigger absolute lifts than another temporal-storage refinement.
+
+The L2 spec below is preserved as a frozen design reference. Re-open if a future change (e.g., raising generator `max_facts`, query-aware top-K filtering) eliminates the cat-1 crowding mechanism — then Option C's lift becomes pure cat-2 upside without a cat-1 ceiling. Or if production telemetry shows the latent `created_at` silent-overload bug is causing user-visible problems, the scorer rewire becomes its own justification.
+
+The remaining cat-2 ceiling (0.49 → 0.60 = ~10pp) is mostly the "non-date gold answer mis-categorized as cat-2 in the dataset" structural noise we identified in the original diagnosis — uninfluenceable by any temporal fix.
+
+**Bench cost**: ~$8 API + 2hr wall to learn this. Cheap insurance for the strategic call.
 
 ---
 
