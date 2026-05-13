@@ -338,14 +338,14 @@ Memory processing happens **after sessions end**, not during. Inspired by human 
 │                                                                      │
 │  1. Extract FACTS                                                    │
 │     "User mentioned they are vegetarian" → memory_facts             │
-│     "User's daughter is named Emma" → memory_facts                  │
+│     "User's daughter is named Dawn" → memory_facts                  │
 │                                                                      │
 │  2. Extract PREFERENCES                                              │
 │     "User asked for shorter responses twice" → memory_preferences   │
 │                                                                      │
 │  3. Extract ENTITIES + RELATIONS                                     │
-│     "Kris" (person), "Bruno" (pet) → memory_entities                │
-│     "Kris" → owns → "Bruno" → memory_relations                     │
+│     "Jon" (person), "Buddy" (pet) → memory_entities                │
+│     "Jon" → owns → "Buddy" → memory_relations                     │
 │     Existing entity names fed into prompt to prevent duplicates     │
 │                                                                      │
 │  4. Generate SUMMARY                                                 │
@@ -559,12 +559,13 @@ For 1,000 document chunks: ~1.5 MB of vector data (trivial)
 
 ## 6. Storage Schema
 
-Using SQLite (already a DAWN dependency for auth). Current schema version: **v42**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
+Using SQLite (already a DAWN dependency for auth). Current schema version: **v46**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
 
 Convention notes:
-- All `created_at` / `last_accessed` / `first_seen` / `last_seen` / `valid_from` / `valid_to` columns are **`INTEGER` Unix epoch seconds**, not SQL `TIMESTAMP`. Defaults are `(strftime('%s','now'))`.
+- All `created_at` / `last_accessed` / `first_seen` / `last_seen` / `valid_from` / `valid_to` / `linked_at` / `proposed_at` columns are **`INTEGER` Unix epoch seconds**, not SQL `TIMESTAMP`. Defaults are `(strftime('%s','now'))` for "set on insert" columns and literal constants (`0` / `NULL`) for columns added via post-v33 migrations (literal-constant defaults take SQLite's O(1) metadata-only ALTER path — no full-table rewrite under the auth_db lock at startup).
 - All foreign keys to `users(id)` cascade on user delete. Schema text below shows the live database shape; the migration history adds columns one at a time, so column ordering reflects insert-history rather than logical grouping.
 - All "source_*" provenance columns (added v40 / extended v42 in Phase B) point back into `conversations` / `messages` so retrieval can render the original utterance — see [PROVENANCE.md](PROVENANCE.md).
+- v43-v46 add the entity-alias / user-identity / summary-embedding workstream on top of the v33-v42 base. See §6.4 (entities `canonical_id` + `is_user_self`), §6.4.1-§6.4.2 (alias audit log + review-band proposals), §6.3 (`memory_summaries.embedding` BLOB), §6.9 (users `real_name` / `preferred_address` / `identity_aliases`).
 
 ### 6.1 Memory Facts Table
 
@@ -628,7 +629,7 @@ CREATE TABLE memory_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     session_id TEXT NOT NULL,
-    summary TEXT NOT NULL,              -- "Discussed home automation setup..."
+    summary TEXT NOT NULL,              -- "Discussed home automation setup..." (~850 chars after v45 prompt bump)
     topics TEXT,                        -- JSON array or comma-joined: "home automation, mqtt"
     sentiment TEXT,                     -- 'positive', 'neutral', 'frustrated'
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
@@ -638,11 +639,15 @@ CREATE TABLE memory_summaries (
     source_conversation_id INTEGER DEFAULT NULL,  -- v42 — Phase B provenance
     source_msg_id_start    INTEGER DEFAULT NULL,
     source_msg_id_end      INTEGER DEFAULT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    embedding BLOB DEFAULT NULL,        -- v45 — semantic summary search (bge-small-en-v1.5-int8)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_memory_summaries_user ON memory_summaries(user_id, created_at DESC);
 ```
+
+`embedding` (v45) is populated by `memory_embeddings_embed_and_store_summary()` at extraction time and backfilled by the recompute worker for pre-v45 rows. The v46 migration NULLs `users.embeddings_model_id` so the recompute worker picks every user up as stale and backfills the column on next boot. The summary adapter (`memory_focus_adapters.c`) hybrids keyword + cosine when this is populated; NULL rows fall back to keyword-only matching. See [SUMMARY_SEMANTIC.md](SUMMARY_SEMANTIC.md) if it exists or §11 / S9 for the surrounding workstream.
 
 ### 6.4 Memory Entities Table
 
@@ -650,21 +655,91 @@ CREATE INDEX idx_memory_summaries_user ON memory_summaries(user_id, created_at D
 CREATE TABLE memory_entities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
-    name TEXT NOT NULL,                 -- Display name (e.g., "Kris Kersey")
+    name TEXT NOT NULL,                 -- Display name (e.g., "Jonathan Smith")
     entity_type TEXT NOT NULL,          -- "person", "place", "pet", "project", "thing"
-    canonical_name TEXT NOT NULL,       -- Lowercase normalized (e.g., "kris kersey")
+    canonical_name TEXT NOT NULL,       -- Lowercase normalized (e.g., "jonathan smith")
     embedding BLOB DEFAULT NULL,        -- Float array for semantic search
     embedding_norm REAL DEFAULT NULL,   -- Pre-computed L2 norm
+    photo_id TEXT DEFAULT NULL,         -- Image-store id for the entity portrait
     first_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     last_seen INTEGER,
     mention_count INTEGER DEFAULT 1,
-    photo_id TEXT DEFAULT NULL,         -- Image-store id for the entity portrait
+    canonical_id INTEGER DEFAULT NULL REFERENCES memory_entities(id) ON DELETE SET NULL,
+                                        -- v43 — soft-alias self-FK (NULL = self is canonical)
+    is_user_self INTEGER NOT NULL DEFAULT 0,
+                                        -- v43 — exactly-one-per-user flag (anchor entity)
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     UNIQUE(user_id, canonical_name)
 );
 
-CREATE INDEX idx_memory_entities_user ON memory_entities(user_id);
+CREATE INDEX idx_memory_entities_user      ON memory_entities(user_id);
+CREATE INDEX idx_memory_entities_canonical ON memory_entities(canonical_id) WHERE canonical_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_memory_entities_user_self
+   ON memory_entities(user_id) WHERE is_user_self = 1;
 ```
+
+**Soft-alias semantics (v43)**: `canonical_id IS NULL` means the row is canonical; `canonical_id = N` means the row is a soft alias of entity N. The link is reversible — `memory_db_entity_alias_unlink()` clears `canonical_id` back to NULL without losing the row. Read paths (`memory_db_entity_get_by_name`, `memory_db_entity_search`, the admin canonical-list) aggregate `mention_count` / `first_seen` / `last_seen` across the canonical's equivalence class via correlated subqueries — see Bundle 2 (commit `0e9ae1e`, 2026-05-13). The single-level alias invariant is enforced at `alias_link` time: a row whose own id is already referenced as another row's `canonical_id` cannot itself become an alias, which bounds equivalence-class depth to 1.
+
+**`is_user_self` (v43)**: the partial UNIQUE index `idx_memory_entities_user_self WHERE is_user_self = 1` enforces "exactly one user-self entity per user." Auto-promoted at extraction when a fresh canonical matches `users.real_name`; also promoted lazily on Settings save by `memory_db_entity_auto_promote_user_self_by_real_name()`. Carries a +0.20 bonus in the entity-merge composite scorer so user-self mentions cluster tightly. See §11 Phase 6.7+ for the entity-merge workstream.
+
+### 6.4.1 Memory Entity Aliases (v43)
+
+Append-only audit log for soft + hard merges. Not consulted on hot read paths — those use `canonical_id` JOINs — but answers "why was X linked to Y, and when?" for the WebUI Graph tab and `dawn-admin memory entity history`.
+
+```sql
+CREATE TABLE memory_entity_aliases (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id               INTEGER NOT NULL,
+    source_entity_id      INTEGER,                 -- nullable: SET NULL on hard-merge delete
+    target_entity_id      INTEGER NOT NULL,
+    source_canonical_name TEXT NOT NULL,           -- preserved so the audit row survives the row delete
+    target_canonical_name TEXT NOT NULL,
+    link_kind             TEXT NOT NULL,           -- "soft", "hard", "user_self_promote", "synthetic_self"
+    reason                TEXT NOT NULL,           -- "auto_merge_phase2", "operator_webui", "auto_promote_realname", ...
+    composite_score       REAL,                    -- entity-merge composite at link time (NULL for promotions)
+    evidence_json         TEXT,                    -- per-stage scoring breakdown for debugging
+    linked_at             INTEGER NOT NULL,
+    consolidated_at       INTEGER,                 -- timestamp of soft → hard promotion (NULL if still soft)
+    unlinked_at           INTEGER,                 -- timestamp of unlink operation (NULL if still active)
+    unlink_reason         TEXT,
+    FOREIGN KEY (user_id)          REFERENCES users(id)            ON DELETE CASCADE,
+    FOREIGN KEY (source_entity_id) REFERENCES memory_entities(id)  ON DELETE SET NULL,
+    FOREIGN KEY (target_entity_id) REFERENCES memory_entities(id)  ON DELETE SET NULL
+);
+
+CREATE INDEX idx_memory_entity_aliases_user_target
+   ON memory_entity_aliases(user_id, target_entity_id)
+   WHERE unlinked_at IS NULL;
+```
+
+### 6.4.2 Memory Entity Merge Proposals (v43)
+
+Review-band staging for the Phase 2 auto-merge gate. When the entity-merge cascade scores a candidate pair between `review_threshold` (default 0.50) and `auto_threshold` (default 0.90), it lands here instead of being applied directly. Approving a proposal writes the soft link via the regular alias path; rejecting just stamps `resolved_at`. Cleared by reextract alongside `memory_entity_aliases` — both are derived state.
+
+```sql
+CREATE TABLE memory_entity_merge_proposals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL,
+    source_entity_id INTEGER NOT NULL,
+    target_entity_id INTEGER NOT NULL,
+    composite_score  REAL NOT NULL,
+    evidence_json    TEXT NOT NULL,
+    proposed_at      INTEGER NOT NULL,
+    resolved_at      INTEGER,
+    resolution       TEXT,                         -- "approved", "rejected", "deferred"
+    FOREIGN KEY (user_id)          REFERENCES users(id)            ON DELETE CASCADE,
+    FOREIGN KEY (source_entity_id) REFERENCES memory_entities(id)  ON DELETE CASCADE,
+    FOREIGN KEY (target_entity_id) REFERENCES memory_entities(id)  ON DELETE CASCADE
+);
+
+CREATE INDEX idx_merge_proposals_pending
+   ON memory_entity_merge_proposals(user_id, proposed_at)
+   WHERE resolved_at IS NULL;
+```
+
+WebUI surfaces the pending count via the memory-icon dot indicator and a Suggested-Merges panel on the Graph tab. First click on the lit icon auto-routes to the Graph tab with a 600 ms accent-glow flash; subsequent clicks respect whichever tab was last active.
+
+`idx_contacts_field_lvalue` (functional index on `lower(value)`, added in the same v43 post-migration block) backs the contacts self-join inside `compute_contact_field_overlap` so Phase 2's per-extraction scoring stays O(log N) per JOIN instead of O(N²).
 
 ### 6.5 Memory Relations Table
 
@@ -771,11 +846,18 @@ CREATE TABLE users (
     failed_attempts INTEGER DEFAULT 0,
     lockout_until INTEGER DEFAULT 0,
     categories_backfilled_at INTEGER DEFAULT 0,    -- v34 — fact-category backfill marker
-    embeddings_model_id      TEXT DEFAULT NULL     -- v41 — last completed re-embed model
+    embeddings_model_id      TEXT DEFAULT NULL,    -- v41 — last completed re-embed model
+    real_name                TEXT DEFAULT NULL,    -- v44 — required for link-user-self
+    preferred_address        TEXT DEFAULT NULL,    -- v44 — "They prefer to be addressed as ..."
+    identity_aliases         TEXT DEFAULT NULL     -- v44 — newline-separated alternate names
 );
 ```
 
 Memory-related columns only. The admin/auth columns are documented under the auth subsystem.
+
+**v44 user-identity columns** retire the persona-description borrow that conflated AI behavior with user identity. `real_name` is required by the entity-merge `link-user-self` synthetic-seed path (gate enforced in `memory_alias_link_user_self_run`). `preferred_address` and `identity_aliases` feed both the LLM system prompt's identity block (`build_identity_block` in `src/webui/webui_server.c`) and the synthetic-self resolver token set used by Phase 1.5 of the entity-merge cascade. `identity_aliases` is parsed at use-site (split on `\n`, strip whitespace, drop empties, dedupe case-insensitive). All three are nullable TEXT — existing rows migrate to NULL.
+
+**v46 recompute trigger**: the v46 migration runs `UPDATE users SET embeddings_model_id = NULL` so every user is picked up as stale by the embedding-recompute worker on next boot, backfilling the v45-added `memory_summaries.embedding` column. Side effect: facts + entities also get re-embedded — wasted work in the strict sense, but bounded (the dev's ~2k facts + 300 entities + 270 summaries take ~10 s total against the local ONNX engine). The all-three-or-redo-all trade-off is documented inline in `src/memory/memory_embed_recompute.c`.
 
 ### 6.10 Document chunks (RAG)
 
@@ -899,7 +981,7 @@ Extract the following, being CONSERVATIVE (only high-confidence items):
 
 1. FACTS: Discrete pieces of information worth remembering.
    - USER FACTS: Personal info, relationships, work, health, interests
-     Examples: "User is vegetarian", "User's daughter is named Emma"
+     Examples: "User is vegetarian", "User's daughter is named Dawn"
    - DECISIONS: Conclusions reached during conversation
      Examples: "Decided to use Zigbee for garage automation"
    - PLANS: Future intentions mentioned
@@ -935,13 +1017,13 @@ OUTPUT FORMAT (JSON):
     {"old_fact": "...", "new_fact": "...", "reason": "..."}
   ],
   "entities": [
-    {"name": "Kris", "type": "person"},
-    {"name": "Bruno", "type": "pet"},
+    {"name": "Jon", "type": "person"},
+    {"name": "Buddy", "type": "pet"},
     {"name": "Atlanta", "type": "place"}
   ],
   "relations": [
-    {"subject": "Kris", "relation": "lives_in", "object": "Atlanta"},
-    {"subject": "Bruno", "relation": "is_a", "object": "golden retriever"}
+    {"subject": "Jon", "relation": "lives_in", "object": "Atlanta"},
+    {"subject": "Buddy", "relation": "is_a", "object": "golden retriever"}
   ],
   "summary": "...",
   "topics": ["...", "..."]
@@ -1065,7 +1147,7 @@ Handles questions like:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `value` | string | Keywords to search (small tokens, not full sentences). May be empty when paired with `time_range` for time-based discovery. |
-| `time_range` | string | Window like `"24h"` / `"7d"` / `"1w"`; restricts both fact `created_at` and summary recency. Parsed by `parse_time_period()`. |
+| `time_range` | string | Window like `"24h"` / `"7d"` / `"1w"` / `"1y"`; restricts both fact `created_at` and summary recency. Parsed by `parse_time_period()` — units h/m/d/w/y, magnitude cap ~10 years. |
 | `category` | enum | One of the 8 fact categories (see §6.1.1). Pre-filters fact set at SQL level via `memory_db_fact_search_by_category()`. Unknown labels are logged and ignored. |
 | `as_of` | ISO-8601 date | Evaluates relation validity at a historical point. Accepts `YYYY-MM-DD` or bare `YYYY` (= Jan 1). Parsed by `strptime` + `timegm`. |
 | `include_historical` | "true" / "false" | When `true`, the entity-recall path bypasses the open-relation filter and returns superseded relations too. Default `false`. |
@@ -1093,7 +1175,7 @@ The LLM translates natural language to these parameters: "last Thursday" → `ti
 
 ```
 FACTS:
-- [ID:42] User's daughter is named Emma (explicit, 2026-01-10)
+- [ID:42] User's daughter is named Dawn (explicit, 2026-01-10)
 - [ID:118] Decided to use Zigbee for garage automation (inferred, 2026-01-16)
   ┌── source [conv 7, msgs 14-16] ────────────────────────────
   │ user: "let's go with zigbee for the garage"
@@ -1101,7 +1183,7 @@ FACTS:
   └────────────────────────────────────────────────────────────
 
 ENTITIES:
-- Emma (person) — daughter_of Kris
+- Dawn (person) — daughter_of Jon
 - Garage (place) — has_protocol zigbee (since 2026-01-16)
 
 RECENT CONVERSATIONS:
@@ -1151,7 +1233,7 @@ int memory_remember(const char *user_id, const char *fact_text);
 
 #### 9.1.3 Recent Action
 
-Handles time-based queries when the user wants to see what's been learned recently without specific keywords.
+Handles time-based queries when the user wants to see what's been learned recently — or earliest, or within a specific past window — without specific keywords.
 
 **Tool Definition:**
 
@@ -1159,42 +1241,70 @@ Handles time-based queries when the user wants to see what's been learned recent
 { "device": "memory", "action": "recent", "value": "24h" }
 ```
 
-**Supported Time Periods:**
+**Bundle 3 parameters (2026-05-13, commit `32861d5`)** turn `recent` into a fully bounded retrieval surface — newest-or-oldest within an arbitrary `[now − query, now − before]` window:
 
-- Minutes: `30m`, `60m`
-- Hours: `1h`, `24h`, `48h`
-- Days: `1d`, `7d`, `30d`
-- Weeks: `1w`, `2w`
+```json
+{ "device": "memory", "action": "recent",
+  "value": "1y", "sort": "oldest", "limit": 1 }
+```
+
+```json
+{ "device": "memory", "action": "recent",
+  "value": "30d", "before": "7d", "limit": 20 }
+```
+
+| Parameter | Type / range | Description |
+|-----------|-------------|-------------|
+| `value` (= `query`) | time period string, default `"7d"` | Lower bound of the window — how far back the query reaches. Examples: `"24h"`, `"7d"`, `"2w"`, `"30d"`, `"1y"`, `"10y"`. Upper bound is `"10y"` (the parser's overflow cap). |
+| `limit` | int, 1-50, default 20 facts / 10 summaries | Result count per category — facts and summaries each capped to this. |
+| `sort` | `"newest"` (default) / `"oldest"` | Ordering within the window. `"oldest"` is what makes "find my earliest memory" answerable (every pre-Bundle-3 SELECT was DESC-only). |
+| `before` | time period string, default unset | Upper bound — restrict to entries older than `before` ago. Combine with `query` to bracket a window in the past. |
+| `category` | enum | Same 8-label taxonomy as `search` — pre-filters facts at SQL level. |
+
+**Supported time-period units** (`parse_time_period()` in `include/tools/time_utils.h`):
+
+| Unit | Suffix | Multiplier |
+|------|--------|-----------|
+| Minutes | `m` / `M` | 60 |
+| Hours | `h` / `H` / (no suffix) | 3600 |
+| Days | `d` / `D` | 86400 |
+| Weeks | `w` / `W` | 604800 |
+| Years | `y` / `Y` | 31536000 (365 days, not leap-aware — fine for approximate windowing) |
+
+The parser rejects negative values and caps the numeric magnitude at ~10 years to prevent overflow. The `'y'` unit was added as a Bundle 3 fold-in on 2026-05-13 — pre-Bundle-3, `time_range:"year"` silently fell through to "no filter."
 
 **Design Principles:**
 
-- **No keywords required**: Returns all memories within the time window
-- **Discovery-oriented**: For "what have you learned about me lately?"
-- **Reusable parser**: `parse_time_period()` in `include/tools/time_utils.h` available to other tools
+- **`query` is a window bound, not a count**: encodes the principle "how far back do we reach"; `limit` controls how many results come back. The pre-Bundle-3 descriptor confused these and the LLM passed integers as periods.
+- **Sort applies WITHIN the window**: `sort=oldest` returns the earliest entries reachable from `[now − query, now]` — not the earliest in the entire store. To reach the absolute earliest, widen `query` (its upper bound is `"10y"`).
+- **Two-bound windowing**: `query` + `before` together bracket `[now − query, now − before]`, enabling "what happened 3-7 days ago" style queries without keyword overlap.
+- **Search remains hybrid**: the new params are explicitly recent-only; `search` keeps its own hybrid-scoring top-N pattern (the descriptors call this out).
 
-**Recent Implementation:**
+**Implementation:**
 
 ```c
-// Parse human-readable time period into seconds
-// Located in include/tools/time_utils.h for reuse
-time_t parse_time_period(const char *period);  // "24h" -> 86400, "7d" -> 604800
-
-// Get memories created within time window
-char *memory_action_recent(int user_id, const char *period);
+// New public DB helpers (Bundle 3) — until_ts=0 sentinel resolves to INT64_MAX internally.
+int memory_db_fact_list_window(int user_id, time_t since_ts, time_t until_ts,
+                               bool sort_asc, int limit,
+                               memory_fact_t *facts_out, int *count_out);
+int memory_db_summary_list_window(int user_id, time_t since_ts, time_t until_ts,
+                                  bool sort_asc, int limit,
+                                  memory_summary_t *summaries_out, int *count_out);
 ```
+
+Backed by four prepared statements (ASC / DESC × fact / summary). The legacy `stmt_memory_fact_list_since` + `stmt_memory_summary_list_since` are now subsumed by `_list_window` with `until_ts=0` — flagged in TODO for retirement.
 
 **Recent Response Format:**
 
 ```
-RECENT FACTS:
-- User prefers dark mode (explicit, 12 hours ago)
-- Working on home automation project (inferred, 2 days ago)
+RECENT FACTS (oldest first, 1 result within 1y):
+- [ID:5004] Initial workspace setup notes from token-streaming work (inferred, 15 weeks ago)
 
-RECENT CONVERSATIONS:
+RECENT SUMMARIES:
 - [3 hours ago] Discussed memory system implementation...
   Topics: memory, dawn, sqlite
 
-Total: 2 facts, 1 conversations
+Total: 1 fact, 1 summary
 ```
 
 #### 9.1.4 Forget Action
@@ -1258,52 +1368,44 @@ Contacts are linked to memory entities — saving a contact for "Mom" automatica
 
 #### 9.1.6 Merge Entities Action
 
-Combines two duplicate entities, reassigning all relations and contacts from source to target.
+Soft-links two entities that refer to the same person / pet / place / thing. The link is **reversible** — both rows remain in `memory_entities`; the source row's `canonical_id` gets set to the target row's id. The original 6.7 hard-merge (relations reassigned, source row deleted) is preserved as the `dawn-admin memory entity consolidate` admin path for when the operator wants to harden the link.
 
 **Tool Definition:**
 
 ```json
-{ "device": "memory", "action": "merge_entities", "value": "{\"source_name\":\"Kris\",\"target_name\":\"Kris Kersey\"}" }
+{ "device": "memory", "action": "merge_entities",
+  "value": "Jon", "target_name": "Jonathan Smith" }
 ```
 
 **Parameters:**
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `source_name` | Yes | Entity to merge FROM (will be deleted) |
-| `target_name` | Yes | Entity to merge INTO (survives) |
+| `value` (source name) | Yes | Entity name that becomes a soft alias. The row is preserved. |
+| `target_name` | Yes | Entity that stays canonical. Read paths via `COALESCE(canonical_id, id)` resolve here. |
 
-**Merge Behavior:**
+**Soft-link behavior** (`memory_db_entity_alias_link()` in `src/memory/memory_db_alias.c`):
 
-1. Resolve both names to entity IDs via canonical name lookup
-2. BEGIN IMMEDIATE transaction
-3. Reassign all relations (subject + object references) from source to target
-4. Reassign all contacts from source to target
-5. Delete self-referencing relations created by reassignment
-6. Deduplicate relations and contacts via ROW_NUMBER() window functions
-7. Absorb mention count and time range from source
-8. Delete source entity
-9. COMMIT (or ROLLBACK on any error)
+1. Resolve both names to entity IDs via canonical-name lookup.
+2. Verify the single-level alias invariant: refuse if the source row already has dependents (other rows referencing it as `canonical_id`).
+3. Set `source.canonical_id = target.id`. The source row stays — `mention_count`, `first_seen`, `last_seen` etc. are still readable, and equivalence-class aggregation surfaces totals across the canonical + all aliases (Bundle 2, commit `0e9ae1e`).
+4. Write an audit row to `memory_entity_aliases` (`link_kind="soft"`, `reason="operator_webui"` / `"auto_merge_phase2"` / etc., plus the `composite_score` and `evidence_json` from the cascade if applicable).
+5. Atomically invalidate the in-process entity-embedding cache so the next hybrid-search pass sees the new alias chain.
+
+**Read-path semantics**: Searches return the canonical's display fields for both rows in the equivalence class. Bundle 2 added correlated subqueries on `memory_db_entity_get_by_name` + `memory_db_entity_search` + the admin canonical-list so `mention_count` / `first_seen` / `last_seen` are summed / minned / maxed across `WHERE id = e.id OR canonical_id = e.id` — single-level alias bound, EXPLAIN QUERY PLAN verified sub-ms at current scale.
+
+**Reversibility**: `memory_db_entity_alias_unlink()` (admin only) clears `canonical_id` back to NULL and stamps `unlinked_at` on the audit row. Used when an operator-approved merge turns out to be wrong; the entity goes back to standing alone.
+
+**Phase 2 auto-merge gate** (May 2026): during extraction, the cascade scores every fresh canonical against existing entities. Composite ≥ `auto_threshold` (default 0.90) triggers a silent `alias_link`; composite ∈ [`review_threshold`, `auto_threshold`) (default 0.50-0.90) lands in `memory_entity_merge_proposals` for operator review. Approving a proposal calls the same `alias_link` path. See §11 / Phase 6.7+.
 
 #### 9.1.7 Entity Graph Context
 
 Entity graph context is automatically appended to memory search results — it is not a separate tool action. When a search returns facts, the system also queries for related entities and appends an ENTITIES section showing entity names, types, and their relationships. This provides the LLM with graph context without requiring a separate tool call.
 
-#### 9.1.8 LLM Prompt Addition
+#### 9.1.8 Tool Descriptor (canonical source)
 
-```
-For MEMORY:
-- To recall: <command>{"device":"memory","action":"search","value":"keywords"}</command>
-  Use short keywords (1-3 words). Returns matching facts and conversation summaries.
-  Optional: Add "date":"YYYY-MM-DD" or "date_from"/"date_to" for time-based queries.
-  Example: {"device":"memory","action":"search","value":"","date":"2026-01-16"}
-- To see recent: <command>{"device":"memory","action":"recent","value":"24h"}</command>
-  Use for time-based discovery: "24h", "7d", "1w", "30m", etc.
-  Example: {"device":"memory","action":"recent","value":"1w"}
-- To store: <command>{"device":"memory","action":"remember","value":"the fact"}</command>
-  Use when user shares personal info or asks you to remember something.
-  Phrase facts to be self-describing (include context in the text).
-  Respond naturally: "I'll remember that."
-```
+The pre-Bundle-3 prompt-addition block has been retired — DAWN now ships native function-calling schemas via the tool registry, and the canonical descriptor lives in `src/tools/memory_tool.c` (`memory_params[]`). The registry generates per-provider schemas (OpenAI tool_calls, Claude tool_use, native local-LLM formats) from a single struct. The schema includes the 11 params documented in §9.1.1-§9.1.6 plus the action enum. The legacy `<command>` tag fallback is still wired through `text_to_command_nuevo.c` for local models that don't speak any function-calling dialect — it parses the same JSON shape.
+
+The descriptor itself encodes generic *principles* (e.g., "`query` is a window bound, sort orders within the window") rather than baked-in recipes — refined post-Bundle-3 after live testing surfaced the LLM picking wrong windows when the descriptor showed only example values.
 
 #### 9.1.9 When to Use Each
 
@@ -1313,7 +1415,7 @@ For MEMORY:
 | "Remember that I hate cilantro"          | Call `remember` with "User hates cilantro"               |
 | "What do you know about me?"             | Call `search` with broad keywords or list injected facts |
 | "Do you remember my daughter's name?"    | Call `search` with "daughter name"                       |
-| "What did we talk about last Thursday?"  | Call `search` with date filter (convert to YYYY-MM-DD)   |
+| "What did we talk about last Thursday?"  | Call `search` with the phrase in `value` (the `time_query_parser` handles "last Thursday"), or fall through to `recent` with `query="7d"` if no keywords |
 | "What did we decide about the garage?"   | Call `search` with "garage decide"                       |
 | "What have you learned about me lately?" | Call `recent` with "7d" or "1w"                          |
 | "What's new in the past 24 hours?"       | Call `recent` with "24h"                                 |
@@ -1355,7 +1457,7 @@ The extraction job can also detect if a fact was already stored via tool call (d
 │  "Known facts about this user:                                       │
 │   - Vegetarian (explicit, high confidence)                           │
 │   - Works as a software developer                                    │
-│   - Has two children: Emma and Jack                                  │
+│   - Has two children: Dawn and Sam                                   │
 │   - Lives in Atlanta area                                            │
 │   - Timezone: US Eastern"                                            │
 │  +                                                                   │
@@ -1587,7 +1689,7 @@ User confirms → Commit (commit=true) → write to DB
 
 **Files:** `src/webui/webui_contacts.c` (handlers), `www/js/ui/contacts.js` (UI), `www/css/components/contacts.css` (styles)
 
-### Phase 6.7: Entity Merge ✅ COMPLETE
+### Phase 6.7: Entity Merge (hard) ✅ COMPLETE
 
 - [x] `memory_db_entity_merge()` — transactional SQL (BEGIN IMMEDIATE → COMMIT/ROLLBACK)
 - [x] MERGE_EXEC macro for error-checked ad-hoc prepared statements with goto-based rollback
@@ -1602,6 +1704,92 @@ User confirms → Commit (commit=true) → write to DB
 - [x] WebSocket handler with source_id == target_id validation
 
 **Files:** `src/memory/memory_db.c` (merge logic), `src/memory/memory_callback.c` (tool action), `src/webui/webui_memory.c` (WS handler), `www/js/ui/memory.js` (UI)
+
+**Superseded by Phase 6.8+ (May 2026) for the LLM-facing surface** — the `merge_entities` tool action now soft-links via `memory_db_entity_alias_link()`; the original hard-merge logic remains available as `dawn-admin memory entity consolidate` for operators who want to harden a soft link permanently.
+
+### Phase 6.8: Entity Merge — soft aliases + Phase 2 auto-merge (May 2026) ✅ COMPLETE
+
+Equivalence-class soft-merge surface that resolves the user-identity duplicate problem (e.g., "Jon" / "Jonathan Smith" / "User" arriving as three separate entity rows from re-extraction). Schema v43 adds `memory_entities.canonical_id` self-FK + `is_user_self` flag + `memory_entity_aliases` audit log + `memory_entity_merge_proposals` review-band staging + 5 partial indexes including the `idx_contacts_field_lvalue` functional index backing the cascade's contact-overlap scoring.
+
+- [x] **Phase 1 — resolver cascade + operator surface** (commits `9bfda37` + family): new module `src/memory/memory_db_alias.c`; six-stage cascade (exact-canonical → token-Jaccard candidates → type filter with `thing` carve-out → embedding cosine → exclusive-relation / contact overlap → composite-band routing); composite scorer (0.30 name_jaccard + 0.30 embedding_cosine + 0.25 exclusive_relation_overlap + 0.10 contact_field_overlap + 0.05 type_match, +0.10 substring bonus, +0.20 `user_self` bonus, type-veto); soft-link write paths (`alias_link` / `alias_unlink`) with atomic entity-cache invalidation; equivalence-class relation listing via `IN (SELECT id WHERE id=? UNION ALL SELECT id WHERE canonical_id=?)`; single-SQL `exclusive_relation_overlap` with `ORDER BY valid_from DESC`; `canonical_priority` lexicographic comparator with sibling variant taking explicit `is_user_self` flags. Six new admin commands: `dawn-admin memory entity {merge,split,aliases,history,list,link-user-self}`. WebUI Graph-tab Suggested-Merges panel + manual-alias panel + 5 new WebSocket message handlers.
+- [x] **Phase 1.5 — user-identity columns + synthetic-self scoring** (schema v44): `users.real_name` (required), `users.preferred_address`, `users.identity_aliases` (newline-separated); `auth_user_identity_t` + `auth_db_get/set_user_identity()` helpers; system-prompt identity block via `build_identity_block` in `src/webui/webui_server.c`; directional Jaccard for short-name candidates against verbose synthetic; `user`-token allow-list reaching Stage 6 unconditionally; promote-existing-match path replacing always-INSERT seed; commit-mode focused scoring against the user-self entity specifically.
+- [x] **Phase 2 — auto-fire-on-extraction + WebUI dot** (commit `9bfda37`): gate-timing fix moves the resolver from inline entity-upsert to a sweep after the relations loop (so `exclusive_relation_overlap` actually sees the relations); Stage 2 substring rescue gained reverse direction via SQL `instr()`; propose-all-in-band (each scored candidate ≥ `review_threshold` gets its own proposal row instead of winner-only); auto-promote `user_self` at extraction (`memory_db_entity_maybe_auto_promote_user_self()`) + lazy sweep on Settings save (`memory_db_entity_auto_promote_user_self_by_real_name()`); runtime config `[memory.entity_merge] enabled / auto_threshold (0.90) / review_threshold (0.50)`. CONFIG_CLAMP NaN/inf hardening as a codebase-wide side effect. WebUI memory-icon dot indicator (mirrors music-playing dot, pulses 0.5s out of phase, `prefers-reduced-motion` carve-out) + auto-route to Graph tab on first-open-while-pending.
+- [x] **Longer-canonical follow-up** (commit `ed0067c`, 2026-05-12): when the inbound entity has more name tokens than the cascade winner AND both are person/pet/place type, AUTO swaps direction so the longer form becomes canonical and the shorter form becomes the alias (e.g. a fuller "Jonathan Smith" arriving second after "Jon" is already canonical). Five new helper predicates gate the swap (preserves single-level alias invariant via `entity_has_canonical_dependents` check). Applies in both `consider_auto_merge` and the propose-all-in-band loop. REVIEW-band direction preference is filed as a follow-up TODO.
+- [x] **Bundle 2 — equivalence-class read-path aggregation** (commit `0e9ae1e`, 2026-05-13): three SELECTs (`stmt_memory_entity_get_by_name`, `stmt_memory_entity_search`, admin canonical-list) gain correlated subqueries summing `mention_count` / minning `first_seen` / maxing `last_seen` across `WHERE id = e.id OR canonical_id = e.id`. Surfaces the equivalence-class totals on canonical rows so soft-aliasing a high-mention row under a low-mention canonical (e.g. "Jon"(88) → "Jonathan Smith"(10)) renders as the full class total (98) instead of just the canonical's own row. ORDER BY asymmetry is deliberate: admin list sorts by class total (operator source-of-truth), `entity_search` sorts by own `mention_count` (indexable hot path). Same commit bumped `FACT_MAP_MAX` 32 → 128.
+
+**Files:** `src/memory/memory_db_alias.c` (resolver + scoring + write paths), `src/memory/memory_extraction.c` (gate-timing sweep + auto-promote hooks), `src/memory/memory_callback.c` (`merge_entities` rewrite to alias_link), `src/auth/auth_db_settings.c` (identity helpers), `src/webui/webui_server.c` (`build_identity_block` identity block injection), `src/auth/admin_socket.c` (six admin opcodes), `www/js/ui/memory.js` + `memory_aliases.js` (UI), schema v43-v44 in `src/auth/auth_db_core.c`.
+
+### Phase 6.9: Crash-recovery worker (April 2026) ✅ COMPLETE
+
+Picks up conversations whose `last_extracted_msg_count < message_count` after a daemon crash mid-extraction or an extraction failure.
+
+- [x] New `src/memory/memory_recovery.c/h` — dedicated background thread (`nice 10`), immediate startup pass + recurring rescan every `[memory.recovery] recurring_interval_seconds` (default 24 h)
+- [x] Schema v39 adds `conversations.extraction_attempts` + `extraction_last_attempt_at`
+- [x] Auto-reset of cap counter when conversation gets new activity (via `extraction_last_attempt_at < updated_at` clause)
+- [x] Successful extraction clears counters atomically in the existing `memory_db_set_last_extracted` UPDATE
+- [x] Image-strip via `strip_image_markers()` (replaces `[IMAGE:data:image/...]` blocks with `[image]`) so vision-heavy conversations don't blow the extraction prompt size
+- [x] `RECOVERY_MIN_TEXT_CHARS = 50` threshold marks truly-empty conversations as up-to-date with no LLM call
+- [x] Recovery-tagged session_id (`recovery_<conv_id>`) suppresses WebUI toasts on re-extraction
+- [x] Live result: 112 of 117 stuck conversations cleared on first pass (980 messages extracted)
+
+### Phase 6.10: Summary backfill + semantic summary adapter (May 2026) ✅ COMPLETE
+
+Made conversation summaries usefully retrievable per-turn context. Three steps shipped together (Step 4 — full canonical re-extract — completed 2026-05-12 against the dev's 276-conv corpus, $2.19 actual Haiku spend).
+
+- [x] **Step 1 — extraction prompt bump**: summary instruction from "1-2 sentence" to "3-5 sentences, ~1500 chars covering topics / key parameters / decisions / outcomes." New summaries land ~850 chars vs old ~287 p90.
+- [x] **Step 2 — `dawn-admin memory summarize-missing`** (opcode `ADMIN_MSG_MEMORY_SUMMARIZE_MISSING = 0x90`): new module `src/memory/memory_summarize_missing.c` runs the canonical extraction prompt per conversation and stores summary only; shared image-strip + history-load helpers extracted to new `src/memory/memory_history_loader.c` so the new worker reuses recovery's logic. `MEMORY_EXTRACTION_PROMPT_TEMPLATE` promoted to `extern const char *` so backfill and live extraction share one source of truth. `SUMMARIZE_HARD_CAP = 1000` bounds admin-driven LLM spend.
+- [x] **Step 3 — semantic summary search**: schema v45 adds `memory_summaries.embedding BLOB`; v46 NULLs `users.embeddings_model_id` so the recompute worker treats every user as stale and backfills on next boot. `memory_db_summary_search_semantic` runs a two-pass locked scan (pass 1 reads `(id, embedding)` only and ranks survivors via min-heap, top-K capped at `MEMORY_SUMMARY_SEMANTIC_TOPK_CAP = 16` for stack safety; pass 2 fetches full rows for survivors only). `memory_embeddings_embed_and_store_summary()` wires embed-at-create in both the live extractor and the summarize-missing backfill worker. Hybrid `summary_adapter` (`memory_focus_adapters.c`) merges keyword + semantic by summary id and re-ranks by max-score.
+- [x] **Default tuning**: `focus_injection.top_k 8 → 12`, `source_weights.memory_summary 0.7 → 1.0`, `weight_recency` stays at 0.15 pending re-bench with summary-relevant probe (open tension documented in `config_defaults.c`).
+- [x] **Memory-tool double-dip mitigation**: two-sentence nudge in the `--- TURN CONTEXT ---` open framing (`prompt_compose.c`) telling the LLM the focus block already contains its top hits; phrased as a preference, not a prohibition.
+- [x] **Folded in**: paraphrase dedup gate at extraction (cosine ≥ 0.92 bumps existing fact's confidence + extends provenance); meta-fact extraction rule rejects "User asked X" / "User inquired Y" / "User requested Z" phrasings; `memory_db_facts_delete_by_patterns` + `cleanup-meta-facts` admin command; provenance-extend semantics in `memory_db_provenance.c` (same-conv widen / no-prov adopt / newer replace / older no-op).
+- [x] **Step 4 — full re-extract** (2026-05-12): `dawn-admin memory reextract --user admin --confirm` against 276-conv corpus, 35 min wall-clock, $2.19 actual Haiku spend (higher than the original $0.50-1.00 guess — prompt + provenance + categories all grew per-extraction tokens). Updated cost estimate for future re-extracts: ~$2-3 on Haiku for ~280 convs / ~4500 facts.
+
+### Phase 6.11: Embedding model swap + recompute worker (May 2026) ✅ COMPLETE
+
+- [x] **Tech debt**: `memory_embeddings_embed_and_store_entity()` now calls `memory_embeddings_invalidate_entity_cache()` after update, matching the fact wrapper.
+- [x] **ID-based extraction filter**: `conv_db_add_message_ex()` returns the insert row ID; `session_stamp_last_message_id()` plumbs IDs into in-memory history on all live paths; early-skip gate uses `conv_db_get_max_msg_id` vs `last_extracted_msg_id`; count-based cursor retained one release for back-compat.
+- [x] **Background re-embed worker** (`src/memory/memory_embed_recompute.c`, schema v41): detects `model_id` mismatch via `system_metadata.embedding_model_id`, re-embeds facts then entities per user (marking `users.embeddings_model_id` only after both succeed), deferred chunks pass, `meta_set` fires only after chunks complete so interrupted passes restart cleanly. Live recompute: 2,183 embeddings re-indexed across 3 users + 243 document chunks on first boot.
+- [x] **Model swap to bge-small-en-v1.5-int8**: LoCoMo **81.6%** (+7.9pp from 73.7%), cat-3 inference **64.4%** (+8.6pp), LongMemEval R@5 **97.0%** (+1.4pp), ConvoMem **99.0%** (unchanged).
+
+### Phase 6.12: Cat-2 temporal extraction — Phase 1 anchor injection (May 2026) ✅ COMPLETE
+
+Diagnosis localized cat-2 collapse to extraction-time date loss, not retrieval. Phase 1 ships L1 + L5 from the diagnosis.
+
+- [x] Schema v42: `conversations.anchor_date INTEGER NOT NULL DEFAULT 0` (epoch seconds, literal-constant default for SQLite O(1) ALTER fast path)
+- [x] Production `conv_db_create_*` writers populate at insert with `time(NULL)`
+- [x] Bench harness overrides per-session via `parse_locomo_session_date()`
+- [x] Extraction prompt prepends `Conversation anchor: YYYY-MM-DD` when set, instructs the LLM to resolve relative temporal phrases against it AND preserve the original phrase verbatim in `fact_text` (Case-9 protection)
+- [x] New API: `conv_db_get_anchor_date()`, `conv_db_force_anchor_date_unsafe()` (bench-only, authorization-scoped), `ANCHOR_DATE_NONE` sentinel
+- [x] **Measured lift (Haiku, n=1982)**: cat-2 recall_generation **0.022 → 0.321** (+29.9pp; projected 0.15-0.25, exceeded high end by +7pp); overall 0.208 → 0.279 (+7.1pp); bonus lift on cat-3 (+4.4pp) and cat-4 (+5.0pp)
+- [x] Phase 2 (`event_when` structured-field extraction) re-scoped — see Active TODO
+
+### Phase 6.13: Memory provenance — Phase A + Phase B (May 2026) ✅ COMPLETE
+
+Source-linked recall — append verbatim conversation excerpts to retrieved facts so the caller can verify the extractor's paraphrase. Two phases.
+
+- [x] **Phase A** (commit `e1a34de`): validate provenance triple plumbing through extraction; fix silent buffer truncation across 6 paths
+- [x] **Phase B** (commit `4652891`): coverage extension to preferences / summaries / relations; dedup via `memory_source_dedup_set_t`; new module `src/memory/memory_db_provenance.c` (moved out of `memory_db.c` for line-budget); 4 batch source readers (`memory_db_facts_get_sources`, `_relations_get_sources`, `_summaries_get_sources`, `_prefs_get_sources`), each returns parallel `conv_id` / `msg_id_start` / `msg_id_end` arrays for any positive N, auto-chunked at 32 IDs per SQL pass; privacy JOIN against `conversations.is_private`
+- [x] Tool integration: `with_source` param on `search` / `recent`; `[memory] source_budget_chars` config caps total verbatim attached per call; strbuf-based output retired earlier 8 KB cap
+
+### Phase 6.14: Dynamic context injection — Phase 1 (May 2026) ✅ COMPLETE
+
+Per-turn focus block ranks facts / entities / relations / summaries / document chunks / calendar events and prepends them to the LLM prompt.
+
+- [x] New modules: `src/memory/memory_focus_adapters.c` + `memory_fact_search.c` + `focus_source.c` + `focus_recency.c` + `focus_candidate_helpers.c`
+- [x] Header split: `memory_db.h` carved into `memory_db_entities.h` + `memory_db_embeddings.h` + `memory_db_provenance.h` + `memory_db_aliases.h`; umbrella `memory_db.h` re-exports via transitive include so external callers compile unchanged
+- [x] Memory-tool double-dip mitigation: prompt nudge in `prompt_compose.c`
+- [x] Phase 2 (DAWN background context — silent-observe events into a sibling memory store) deferred to its own design pass
+- [x] Cross-encoder reranker on focus-injection candidates filed under Active TODO (addresses cosine over-inclusion on dominant tokens)
+
+### Phase 6.15: LLM-based fact recategorization (April 2026) ✅ COMPLETE
+
+`dawn-admin memory recategorize-all <username>` complements the embedding-centroid backfill (~15% assignment rate) by covering the remaining ~85% via per-fact LLM classification.
+
+- [x] New module `src/memory/memory_recategorize.c`; batches of 25 general-category facts sent to the extraction LLM (reuses `extraction_provider` / `extraction_model` config)
+- [x] Public `memory_extraction_parse_json()` helper (promoted from `extract_json_from_response`)
+- [x] New DB helpers `memory_db_fact_list_general()` / `memory_db_fact_count_general()`
+- [x] Admin socket opcode `ADMIN_MSG_MEMORY_RECATEGORIZE = 0x80`, fire-and-forget pattern; CAS for TOCTOU race; consecutive-failure abort (3 strikes); injection filter on fact text; `pthread_timedjoin_np` timeout
+- [x] First production run: 99.8% classified (946/948 facts in ~80s)
 
 ### S4: Entity Graph ✅ COMPLETE
 
@@ -1618,7 +1806,7 @@ User confirms → Commit (commit=true) → write to DB
 - [x] Bidirectional graph search: outgoing + incoming relations for top entities
 - [x] Entity graph context appended to memory search results (ENTITIES section)
 - [x] Existing entities fed into extraction prompt to prevent duplicate names
-- [x] Entity dedup: canonical name matching prevents "Kris" vs "Kris Kersey" variants
+- [x] Entity dedup: canonical name matching prevents "Jon" vs "Jonathan Smith" variants
 - [x] `_Static_assert` on prepared statement layout for safety
 - [x] Bulk relation loading (`memory_db_relation_list_all_by_user()`) — N+1 query fix
 - [x] Entity deletion with FK-ordered relation cleanup
@@ -1723,120 +1911,166 @@ Phases 7-11 were implemented as a separate subsystem documented in `docs/RAG_DES
 
 ---
 
-**Summary:**
+**Summary (May 2026):**
 
-| System         | Phases | Status           |
-| -------------- | ------ | ---------------- |
-| Memory         | 1-6.7  | ✅ Complete      |
-| Entity Graph   | S4     | ✅ Complete      |
-| Injection Filter | S5   | ✅ Complete      |
-| Categorization | S6     | ✅ Complete      |
-| Temporal Scoring | S7   | ✅ Complete      |
-| Contradiction  | S8     | ✅ Complete      |
-| RAG            | 7-11   | ✅ Complete      |
-| Per-User Docs  | 13     | ✅ Shipped       |
-| Speaker ID     | 12     | Future           |
-| Advanced RAG   | 14     | Future           |
+| System                                | Phases       | Status           |
+| ------------------------------------- | ------------ | ---------------- |
+| Memory base (extraction / retrieval)  | 1-6.7        | ✅ Complete      |
+| Entity Graph                          | S4           | ✅ Complete      |
+| Injection Filter                      | S5           | ✅ Complete      |
+| Categorization                        | S6           | ✅ Complete      |
+| Temporal Scoring                      | S7           | ✅ Complete      |
+| Contradiction Detection               | S8           | ✅ Complete      |
+| Entity Merge — soft aliases + Phase 2 | 6.8          | ✅ Complete      |
+| Crash-Recovery Worker                 | 6.9          | ✅ Complete      |
+| Summary Semantic Adapter              | 6.10         | ✅ Complete      |
+| Embedding Recompute + bge-small swap  | 6.11         | ✅ Complete      |
+| Cat-2 Temporal Anchor (Phase 1)       | 6.12         | ✅ Complete      |
+| Memory Provenance (A + B)             | 6.13         | ✅ Complete      |
+| Dynamic Context Injection (Phase 1)   | 6.14         | ✅ Complete      |
+| LLM Recategorization                  | 6.15         | ✅ Complete      |
+| RAG                                   | 7-11         | ✅ Complete      |
+| Per-User Docs                         | 13           | ✅ Shipped       |
+| Cat-2 Temporal Phase 2 (`event_when`) | future       | Re-scoped        |
+| Cross-Encoder Reranker                | future       | Active TODO      |
+| Dynamic Context Injection — Phase 2   | future       | Future           |
+| Speaker ID                            | 12           | Future           |
+| Advanced RAG                          | 14           | Future           |
 
 ---
 
 ## 12. File Structure
 
-Cross-checked against `ls src/memory/` and `ls include/memory/` at schema v42 (May 2026). New modules from the May 2026 ship-velocity (recovery, recategorize, embed-recompute, filter, provenance, source-dedup) are listed inline below.
+Cross-checked against `ls src/memory/` and `ls include/memory/` at schema v46 (2026-05-13). New modules from the May 2026 ship-velocity (entity-merge alias surface, recovery, recategorize, embed-recompute, filter, provenance, source-dedup, summary backfill, focus adapters, fact search, history loader) are listed inline below. Header-only split (umbrella `memory_db.h` re-exports `memory_db_entities.h` + `memory_db_embeddings.h` + `memory_db_provenance.h` + `memory_db_aliases.h`) shipped 2026-05-08 — external callers compile unchanged.
 
 ```
 include/memory/
-├── memory_db.h                # CRUD for facts, prefs, summaries, entities, relations
-├── memory_db_provenance.h     # Phase B — source-linked recall batch readers
-├── memory_embeddings.h        # Semantic embedding API (multi-provider, hybrid search)
-├── memory_embed_recompute.h   # Background re-embed worker (model_id mismatch)
-├── memory_embed_tokenizer.h   # Shared WordPiece tokenizer (extracted from ONNX provider)
-├── memory_extraction.h        # Sleep-consolidation extraction entry points
-├── memory_filter.h            # Injection-pattern blocklist (~118 patterns + Unicode normalize)
-├── memory_context.h           # Context building for LLM system prompt
-├── memory_maintenance.h       # Nightly decay orchestration API
-├── memory_recategorize.h      # LLM-based fact-category recategorize admin path
-├── memory_recovery.h          # Crash-recovery worker for unconsolidated sessions
-├── memory_similarity.h        # Duplicate detection API (normalize, hash, Jaccard)
-├── memory_types.h             # Data structures (fact, pref, summary, entity, relation,
-│                              #   provenance triple, fact-category taxonomy)
-├── memory_callback_internal.h # Internal types shared by memory_callback.c + provenance
-└── contacts_db.h              # Contact CRUD API (find, add, update, delete, list)
+├── memory_db.h                  # Umbrella header — re-exports the four split headers below
+├── memory_db_entities.h         # Entity CRUD, upsert, search, soft-link aliases
+├── memory_db_embeddings.h       # Fact-embedding storage + cache invalidation
+├── memory_db_aliases.h          # Entity-alias resolver cascade + alias_link/unlink
+├── memory_db_provenance.h       # Phase B — source-linked recall batch readers
+├── memory_db_admin.h            # Admin-only DB helpers (bulk delete, recategorize support)
+├── memory_embeddings.h          # Semantic embedding API (multi-provider, hybrid search)
+├── memory_embed_recompute.h     # Background re-embed worker (model_id mismatch + summary backfill)
+├── memory_embed_tokenizer.h     # Shared WordPiece tokenizer (extracted from ONNX provider)
+├── memory_extraction.h          # Sleep-consolidation extraction entry points
+├── memory_fact_search.h         # Hybrid-search public surface (extracted from memory_embeddings.c)
+├── memory_focus_adapters.h      # Per-turn focus block: facts/entities/relations/summaries/chunks/calendar
+├── memory_filter.h              # Injection-pattern blocklist (~118 patterns + Unicode normalize)
+├── memory_context.h             # Session-start context builder (legacy ~800-tok block)
+├── memory_history_loader.h      # Shared message-history loader for recovery + summarize-missing
+├── memory_maintenance.h         # Nightly decay orchestration API
+├── memory_recategorize.h        # LLM-based fact-category recategorize admin path
+├── memory_recovery.h            # Crash-recovery worker for unconsolidated sessions
+├── memory_summarize_missing.h   # Backfill summary rows for legacy / failed extractions
+├── memory_similarity.h          # Duplicate detection API (normalize, hash, Jaccard)
+├── memory_types.h               # Data structures (fact, pref, summary, entity, relation,
+│                                #   provenance triple, fact-category taxonomy, return codes)
+├── memory_callback_internal.h   # Internal types shared by memory_callback.c + provenance
+├── focus_candidate_helpers.h    # Shared helpers across focus-block adapters
+├── focus_recency.h              # Temporal-decay scoring for focus-block ranking
+├── focus_source.h               # Source-type taxonomy (INTERNAL / EXTERNAL / USER_CONTENT)
+└── contacts_db.h                # Contact CRUD API (find, add, update, delete, list)
 
 include/core/
-├── embedding_engine.h         # Shared embedding API (ONNX, Ollama, OpenAI providers)
-├── time_query_parser.h        # Recognizes temporal expressions in queries
-├── iso8601.h                  # Canonical ISO 8601 parsing (consolidated April 2026)
-└── strbuf.h                   # Growable string buffer used for memory tool output
+├── embedding_engine.h           # Shared embedding API (ONNX, Ollama, OpenAI providers)
+├── time_query_parser.h          # Recognizes temporal expressions in queries (moved from src/tools)
+├── iso8601.h                    # Canonical ISO 8601 parsing (consolidated April 2026)
+└── strbuf.h                     # Growable string buffer used for memory tool output
 
 include/tools/
-├── document_db.h              # Document/chunk CRUD (RAG storage layer)
-├── document_chunker.h         # Text chunking for embedding
-├── document_search.h          # RAG semantic search tool
-├── document_extract.h         # PDF/DOCX/HTML text extraction
-└── document_index_pipeline.h  # Shared indexing pipeline (chunk, embed, store)
+├── document_db.h                # Document/chunk CRUD (RAG storage layer)
+├── document_chunker.h           # Text chunking for embedding
+├── document_search.h            # RAG semantic search tool
+├── document_extract.h           # PDF/DOCX/HTML text extraction
+├── document_index_pipeline.h    # Shared indexing pipeline (chunk, embed, store)
+└── time_utils.h                 # parse_time_period() — h/m/d/w/y unit parsing
 
 src/memory/
-├── memory_db.c                # SQLite CRUD, entity upsert, relation create, entity merge,
-│                              #   contradiction detection (EXCLUSIVE_RELATIONS[],
-│                              #   CONTRADICTORY_PAIRS[], memory_db_relation_supersede)
-├── memory_db_provenance.c     # Phase B — moved out of memory_db.c (line-budget); 4 batch
-│                              #   source readers + privacy JOIN, auto-chunked at 32 IDs
-├── memory_embeddings.c        # Embedding cache, hybrid search, cache invalidation
-├── memory_embed_ollama.c      # Ollama embedding provider (/api/embed endpoint)
-├── memory_embed_openai.c      # OpenAI embedding provider (/v1/embeddings endpoint)
-├── memory_embed_onnx.c        # ONNX Runtime embedding provider (local)
-├── memory_embed_recompute.c   # Background re-embed worker, schema v41 + system_metadata
-├── memory_embed_tokenizer.c   # WordPiece tokenizer shared with reranker investigation
-├── memory_context.c           # Context building for LLM system prompt
-├── memory_callback.c          # LLM tool callback dispatcher (search / remember / forget /
-│                              #   recent + 4 contact actions + entity merge)
-├── memory_extraction.c        # LLM-based extraction: facts, prefs, entities, relations,
-│                              #   summaries, topics; subject-naming + anchor-aware prompt
-├── memory_filter.c            # Injection-pattern blocklist + Unicode normalization
-├── memory_maintenance.c       # Nightly decay orchestration
-├── memory_recategorize.c      # Per-fact LLM recategorization admin command
-├── memory_recovery.c          # Crash-recovery worker (idle 1h, 24h scan, 5-min timeout)
-├── memory_similarity.c        # Duplicate detection (Jaccard, FNV-1a hashing)
-├── memory_source_dedup.c      # source_dedup_set_t — suppresses re-fetched provenance
-└── contacts_db.c              # Contact CRUD (find, add, update, delete, list)
+├── memory_db.c                  # SQLite CRUD, entity upsert, relation create, entity merge,
+│                                #   contradiction detection (EXCLUSIVE_RELATIONS[],
+│                                #   CONTRADICTORY_PAIRS[], memory_db_relation_supersede)
+├── memory_db_alias.c            # Soft-alias resolver cascade (six stages) + scorer +
+│                                #   alias_link/unlink + Phase 2 auto-merge gate
+├── memory_db_admin.c            # Admin-only DB helpers (bulk delete by pattern, etc.)
+├── memory_db_provenance.c       # Phase B — 4 batch source readers + privacy JOIN,
+│                                #   auto-chunked at 32 IDs per SQL pass
+├── memory_embeddings.c          # Embedding cache, hybrid search, cache invalidation
+├── memory_embed_ollama.c        # Ollama embedding provider (/api/embed endpoint)
+├── memory_embed_openai.c        # OpenAI embedding provider (/v1/embeddings endpoint)
+├── memory_embed_onnx.c          # ONNX Runtime embedding provider (local)
+├── memory_embed_recompute.c     # Background re-embed worker, v41 + v46 summary backfill
+├── memory_embed_tokenizer.c     # WordPiece tokenizer shared with reranker investigation
+├── memory_context.c             # Session-start context builder
+├── memory_callback.c            # LLM tool callback dispatcher (search / remember / forget /
+│                                #   recent + 4 contact actions + merge_entities → alias_link)
+├── memory_extraction.c          # LLM-based extraction: facts, prefs, entities, relations,
+│                                #   summaries, topics; subject-naming + anchor-aware prompt;
+│                                #   Phase 2 gate sweep + auto-promote user_self hooks
+├── memory_fact_search.c         # Hybrid search public surface (extracted from memory_embeddings.c)
+├── memory_filter.c              # Injection-pattern blocklist + Unicode normalization
+├── memory_focus_adapters.c      # Focus-block adapters (fact / entity / relation / summary
+│                                #   / doc_chunk / calendar / user_content) + summary semantic adapter
+├── memory_history_loader.c      # Shared image-strip + history-load for recovery + summarize-missing
+├── memory_maintenance.c         # Nightly decay orchestration
+├── memory_recategorize.c        # Per-fact LLM recategorization admin command
+├── memory_recovery.c            # Crash-recovery worker (idle 1h, 24h scan, 5-min timeout)
+├── memory_similarity.c          # Duplicate detection (Jaccard, FNV-1a hashing)
+├── memory_source_dedup.c        # source_dedup_set_t — suppresses re-fetched provenance
+├── memory_summarize_missing.c   # dawn-admin memory summarize-missing — opcode 0x90
+├── focus_candidate_helpers.c    # Shared helpers across focus-block adapters
+├── focus_recency.c              # Temporal-decay scoring used inside the focus-block adapters
+├── focus_source.c               # Source-type tagging for trust-boundary filter routing
+└── contacts_db.c                # Contact CRUD (find, add, update, delete, list)
 
 src/core/
-├── embedding_engine.c         # Provider-agnostic embedding + vector math
-├── time_query_parser.c        # Layer 1 temporal-expression recognizer
-├── iso8601.c                  # Canonical ISO 8601 parsing
-└── strbuf.c                   # Growable string buffer (256 KiB cap, sticky-OOM)
+├── embedding_engine.c           # Provider-agnostic embedding + vector math
+├── time_query_parser.c          # Layer 1 temporal-expression recognizer
+├── iso8601.c                    # Canonical ISO 8601 parsing
+└── strbuf.c                     # Growable string buffer (256 KiB cap, sticky-OOM)
 
 src/tools/
-├── document_db.c              # SQLite CRUD for documents and chunks
-├── document_chunker.c         # Paragraph/sentence splitting with configurable overlap
-├── document_search.c          # RAG search: cosine + keyword + temporal-proximity
-├── document_extract.c         # PDF (MuPDF), DOCX (libzip+libxml2), HTML, plain text
-├── document_index_tool.c      # LLM tool for URL-based document ingestion
-└── document_index_pipeline.c  # SHA-256 dedup, chunking, embedding, DB storage
+├── document_db.c                # SQLite CRUD for documents and chunks
+├── document_chunker.c           # Paragraph/sentence splitting with configurable overlap
+├── document_search.c            # RAG search: cosine + keyword + temporal-proximity
+├── document_extract.c           # PDF (MuPDF), DOCX (libzip+libxml2), HTML, plain text
+├── document_index_tool.c        # LLM tool for URL-based document ingestion
+├── document_index_pipeline.c    # SHA-256 dedup, chunking, embedding, DB storage
+└── memory_tool.c                # Tool registry metadata + descriptor (11 params)
 
 src/webui/
-├── webui_memory.c             # WebUI memory endpoints (list, delete, stats, entities,
-│                              #   import/export with filter pre-pass)
+├── webui_memory.c               # WebUI memory endpoints (list, delete, stats, entities,
+│                                #   import/export with filter pre-pass)
+├── webui_contacts.c             # WebUI contact CRUD endpoints
 └── ...
 
+src/auth/
+├── admin_socket.c               # dawn-admin socket — memory-entity dispatch handlers
+│                                #   (consolidate / aliases / proposals / link-user-self / ...)
+└── auth_db_settings.c           # User-identity helpers (v44 real_name / preferred_address / aliases)
+
 www/js/ui/
-├── memory.js                  # Memory viewer UI (tabs, search, entity graph, delete)
+├── memory.js                    # Memory viewer UI (tabs, search, entity graph, delete,
+│                                #   memory-icon dot indicator + auto-route)
+├── memory_aliases.js            # Alias panel + Suggested-Merges UI
 └── ...
 
 www/css/components/
-├── memory.css                 # Memory viewer styles (entity badges, relations, tabs)
+├── memory.css                   # Memory viewer styles (entity badges, relations, tabs,
+│                                #   dot indicator pulse + prefers-reduced-motion carve-out)
 └── ...
 
 benchmarks/
-├── bench_retrieval.c          # C-side retrieval scoring driver (LongMemEval/LoCoMo/ConvoMem)
-├── bench_memory_pipeline.c    # End-to-end extraction + retrieval bench (Phase 0+ memory mode)
-├── bench_temporal_arithmetic.py  # Cat-2 temporal-arithmetic LLM guardrail (May 2026)
-├── run_benchmark.py           # Orchestrator
+├── bench_retrieval.c            # C-side retrieval scoring driver (LongMemEval/LoCoMo/ConvoMem)
+├── bench_memory_pipeline.c      # End-to-end extraction + retrieval bench (Phase 0+ memory mode)
+├── bench_temporal_arithmetic.py # Cat-2 temporal-arithmetic LLM guardrail
+├── bench_contradiction.c        # 215-pair embedding contradiction experiment (preserved for reuse)
+├── run_benchmark.py             # Orchestrator
 └── ...
 
 scripts/
-└── scan_legacy_memory_filter.c   # One-time legacy-data scanner against memory_filter_check
+└── scan_legacy_memory_filter.c  # One-time legacy-data scanner against memory_filter_check
 ```
 
 ---
@@ -2175,7 +2409,7 @@ facts that failed embedding on first attempt. Controlled by the
 │  │ ● User is vegetarian                              [✏️] [🗑️] │   │
 │  │   Source: explicit  |  Confidence: 95%  |  Jan 15, 2026     │   │
 │  ├─────────────────────────────────────────────────────────────┤   │
-│  │ ● User's daughter is named Emma                   [✏️] [🗑️] │   │
+│  │ ● User's daughter is named Dawn                   [✏️] [🗑️] │   │
 │  │   Source: explicit  |  Confidence: 92%  |  Jan 10, 2026     │   │
 │  ├─────────────────────────────────────────────────────────────┤   │
 │  │ ○ User prefers concise responses                  [✏️] [🗑️] │   │
@@ -2280,18 +2514,18 @@ Legend:
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Kris                                          [person] [🗑️] │   │
+│  │  Jon                                           [person] [🗑️] │   │
 │  │  Mentions: 12  |  First: Jan 10  |  Last: Mar 3             │   │
 │  │  ▸ Show relations (3)                                       │   │
 │  │    → lives_in: Atlanta                                      │   │
 │  │    → works_on: The OASIS Project                            │   │
-│  │    → owns: Bruno                                            │   │
+│  │    → owns: Buddy                                            │   │
 │  ├─────────────────────────────────────────────────────────────┤   │
-│  │  Bruno                                           [pet] [🗑️]  │   │
+│  │  Buddy                                           [pet] [🗑️]  │   │
 │  │  Mentions: 5  |  First: Jan 15  |  Last: Feb 28             │   │
 │  │  ▸ Show relations (2)                                       │   │
 │  │    → is_a: golden retriever                                 │   │
-│  │    ← owned_by: Kris                                         │   │
+│  │    ← owned_by: Jon                                          │   │
 │  ├─────────────────────────────────────────────────────────────┤   │
 │  │  Atlanta                                       [place] [🗑️]  │   │
 │  │  Mentions: 3  |  First: Jan 12  |  Last: Feb 20             │   │
@@ -2422,9 +2656,9 @@ The current memory system uses **keyword-based search** (SQL LIKE queries). This
 
 | Query                   | Stored Fact                          | Keyword Search              | Semantic Search                        |
 | ----------------------- | ------------------------------------ | --------------------------- | -------------------------------------- |
-| "What's my dog's name?" | "My pet Bruno is a golden retriever" | ❌ No match (no word "dog") | ✅ Match (dog ≈ pet, golden retriever) |
+| "What's my dog's name?" | "My pet Buddy is a golden retriever" | ❌ No match (no word "dog") | ✅ Match (dog ≈ pet, golden retriever) |
 | "food allergies"        | "User is allergic to shellfish"      | ❌ No match                 | ✅ Match (allergies ≈ allergic)        |
-| "daughter"              | "Emma is the user's child"           | ❌ No match                 | ✅ Match (daughter ≈ child)            |
+| "daughter"              | "Dawn is the user's child"           | ❌ No match                 | ✅ Match (daughter ≈ child)            |
 
 **Semantic search** uses **embeddings** (vector representations of meaning) to find conceptually similar content even when words differ.
 
@@ -2463,7 +2697,7 @@ User Query: "What's my dog's name?"
 
 **Benefits:**
 
-- **Keywords** catch exact matches ("Bruno" finds "Bruno")
+- **Keywords** catch exact matches ("Buddy" finds "Buddy")
 - **Vectors** catch semantic matches ("dog" finds "golden retriever")
 - Together they're more robust than either alone
 
