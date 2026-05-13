@@ -1,8 +1,8 @@
 # Phase 1j Focus-Injection Weight Tuning Log
 
-**Status:** Closed — single iteration produced 11/11 across all providers.
+**Status:** Closed.  Original pass (2026-05-08) produced 11/11 across all providers.  Re-bench (2026-05-13) added summary-relevant probes and promoted `weight_recency` 0.15 → 0.30; updated baseline 15/15 across all providers.  See [Re-bench (2026-05-13)](#re-bench-2026-05-13) section.
 
-**Date:** 2026-05-08.
+**Date:** 2026-05-08 (original); 2026-05-13 (re-bench).
 
 **Bench:** `benchmarks/bench_focus_fix_rate.py` (Component 6 — end-to-end
 fix-rate probe).  Multi-model 2-of-3 quorum across anthropic / openai /
@@ -137,3 +137,48 @@ The headline change is two lines:
 +   config->memory.focus_injection.weight_recency = 0.15f;
 +   config->memory.focus_injection.weight_importance = 1.0f;
 ```
+
+---
+
+## Re-bench (2026-05-13)
+
+**Trigger:** Post-Step-4 (2026-05-12 full reextract producing ~271 summaries against the canonical extraction prompt) live observation suggested `weight_recency = 0.30` ranks recent semantic summary matches above legacy paraphrase-ladder facts on real user queries — a shape the v2 fixtures didn't probe.  Open tension was documented in `config_defaults.c` and `dawn.toml.example` for operators.
+
+**Scope (per `dawn/docs/PHASE_1J_REBENCH_DESIGN.md`):**
+
+1. Harness drift fix — `DEFAULT_FOCUS_CONFIG.source_weights.memory_summary` 0.7 → 1.0 (mirrors the Step-3 production default); `top_k=8` kept as stress parameter with explicit comment.
+2. Four new fixture cases (12-15) added to `focus_probe_cases.json` (schema 2, total 15):
+   - Case 12 `recent_summary_beats_paraphrase_ladder` — designed-FAIL @ 0.15
+   - Case 13 `mothers_day_overinclusion` — designed-FAIL @ 0.15
+   - Case 14 `regression_old_summary_stays_below_recent_fact` — regression guard, designed-PASS @ both
+   - Case 15 `summary_source_weight_step3_validation` — Step-3 retroactive validation, designed-PASS @ both under sw=1.0; would FAIL under legacy sw=0.7
+3. Two paid `--recalibrate` runs to compare 0.15 vs 0.30.
+
+**Results:**
+
+| Run | `weight_recency` | anthropic | openai | local | Cases 12+13 | Case 14 | Existing 11 |
+|---|---|---|---|---|---|---|---|
+| A | 0.15 | 13/15 | 13/15 | 13/15 | FAIL × 3 | PASS | All PASS |
+| B | 0.30 | **15/15** | **15/15** | **15/15** | **PASS × 3** | **PASS** | All PASS |
+
+**Decision:** Promote `weight_recency` 0.15 → 0.30.  Per the design-doc decision matrix:
+
+> 11/11 / 11/11 | 0.30 ≥ +2 cases over 0.15 on 12+13, both pass 14+15 | **Promote 0.30** to default
+
+Run B lifted cases 12 and 13 from unanimous FAIL across all three providers to unanimous PASS, while case 14 (the regression-guard against over-correction) stayed PASS under 0.30 — the candidate weight does not promote stale items above legitimate recent ones.  No regression on the original 11 cases.
+
+**Why the recency-weight bump works on the new cases:**
+
+The recency contribution differential between summary (rec=0.95) and decoy (rec≈0.20-0.30) at w_rec=0.30 vs 0.15 is `0.30 * 0.95 - 0.15 * 0.95 = 0.1425` extra for the summary, minus `0.30 * 0.25 - 0.15 * 0.25 = 0.0375` extra for the decoy = **+0.105 net composite advantage** for the recent summary.  At the fixture-designed semantic gap of ~0.10-0.15 between the summary (sem=0.70) and the paraphrase-ladder decoys (sem≈0.83-0.86), the recency boost is enough to flip the ranking — which is exactly the live-observed pathology the re-bench was scoped to validate.
+
+The regression guard (case 14) survives because the right-answer fact already wins by ~0.30 composite at w_rec=0.15 (high importance + high recency + decent semantic), and the +0.105 net boost from w_rec=0.30 doesn't close that gap.
+
+**Cost:** `agent ~4 hr · api ~$0.40-0.50 · 1 ckpt`.  Came in slightly over the design doc's $0.30-0.40 estimate due to 15-case fixture set (vs the original 11) running through 3 providers × 2 weight configurations.
+
+**Files updated (2026-05-13):**
+
+1. `src/config/config_defaults.c:346-364` — `weight_recency` 0.15f → 0.30f; comment block updated to cite re-bench instead of "open tension."
+2. `dawn.toml.example:538-552` — example weight bumped 0.15 → 0.30 with explicit re-bench note.
+3. `benchmarks/bench_focus_fix_rate.py:70-86` — `HEAD_BASELINE_FIX_COUNT` updated to `{anthropic: 15, openai: 15, local: 15}`; recalibration comment block rewritten.
+4. `benchmarks/bench_focus_fix_rate.py:DEFAULT_FOCUS_CONFIG` — `weight_recency` 0.15 → 0.30 (mirrors new daemon default); `source_weights.memory_summary` 0.7 → 1.0 (Step-3 harness drift fix); comment block added on `top_k=8` stress parameter.
+5. `benchmarks/focus_probe_cases.json` — schema header updated; cases 12-15 appended (total 15 cases).
