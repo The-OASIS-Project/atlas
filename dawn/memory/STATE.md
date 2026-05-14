@@ -4,7 +4,7 @@
 
 **North star:** JARVIS/FRIDAY minus sci-fi. The assistant feels like it knows the user, anticipates relevant context as the conversation shifts, never confabulates, never says "let me search my files." Trust is the substrate; benchmark scores serve that goal, they don't define it. When in doubt, prioritize work that strengthens the JARVIS-shape behavior over work that closes a bench gap that doesn't.
 
-**Last updated:** 2026-05-13 (after **Phase 0 + Phase 1A** shipped — extraction-prompt redesign for paired-output schema and entity-graph 1-hop retrieval at query time, validated together at +13.4pp overall LoCoMo recall_reach and +16.3pp on cat-3 multi-hop.  Two commits, `0cdca08` Phase 0 + `4f8f122` Phase 1A, in order because Phase 1A required Phase 0's dense relation graph to deliver lift.  See Recently shipped row at top of table for full detail).  Previous milestone: **Bundle 3 — memory tool windowed/sorted retrieval** (also 2026-05-13), completing a four-commit memory-subsystem cleanup sequence: Step 4 reextract validation surfaced four issues live; all four shipped 2026-05-12 → 2026-05-13. Bundle 3 closes the LLM-facing tool-surface gaps that surfaced when DAWN self-introspected with "find your oldest memory" — three new params on `recent` (`limit` 1-50, `sort` newest/oldest, `before` for windowed queries), two new `memory_db_*_list_window` functions taking `(since_ts, until_ts, sort_asc, limit)` with `until_ts=0` → INT64_MAX sentinel, four new prepared statements (ASC/DESC × fact/summary). Folded in: `parse_time_period` gained `'y'` (years) support — silently fell through to "no filter" when the LLM tried `time_range:"year"`. Descriptors rewritten to encode the generic principle "query is a window bound, sort orders within the window" so the LLM picks the right window without baked-in recipes. **Live-validated end-to-end** via the original self-introspection — Friday correctly called `recent(query="1y", sort="oldest", limit=1)` after the descriptor refresh and returned ID:5004 from 15 weeks ago (workspace setup + token-streaming schematic conversation, the actual genesis point of the memory tooling). Commit `32861d5`. **Same sequence (2026-05-12 → 2026-05-13):** Bundle 2 (`0e9ae1e`) added equivalence-class stats aggregation — three SELECTs (`entity_get_by_name`, `entity_search`, admin canonical-list) gain correlated subqueries computing SUM(mention_count) / MIN(first_seen) / MAX(last_seen) across `WHERE id = e.id OR canonical_id = e.id`, single-level alias invariant bounds the OR clause to one hop; soft-aliasing "Kris Kersey (88)" → "Kristopher Kersey (10)" now renders the actual class total 277 (= 179 User + 88 Kris + 10 Kristopher) instead of just the canonical's own 10. Bundle 2 also bumped `FACT_MAP_MAX` 32 → 128 (Step 4 surfaced overflow on long convs). Bundle 1 (`ad86629`) wired transient-network HTTP error classification end-to-end through the LLM stack — pre-flight + HTTP {429, 500, 502, 503, 504} all set `LLM_ERR_TRANSIENT_NETWORK`, tool-loop retries with backoff (1s/2s/4s, re-entering rate limit), session_manager distinguishes transient-vs-hard in failure log + WebUI stream-end reason. Bundle 1 also folded in the `relation_supersede` FK violation diagnostic surfaced during Step 4 (`fk_row_exists()` probe on `xrc=787` + defensive `memory_db_fact_get` validation; root cause filed as follow-up TODO). Bug 1 (`af99c4f`) ships the recovery-worker undo path for transient errors so a network blip during reextract doesn't shelve conversations. Bug 2 (`afd0168`) adds `memory_db_entity_upsert_at` so a full reextract preserves entity `first_seen` chronology (now spans Jan-May 2026 instead of all "today"). Plus longer-canonical-name preference for person/pet/place types in entity merge (`ed0067c`, May 12) — Phase 2 follow-up that swaps merge direction when the inbound name has more tokens than the existing canonical. **Step 4 reextract validated end-to-end 2026-05-12**: ran `dawn-admin memory reextract --user admin --confirm` against the 276-conv corpus in 35 minutes / $2.19 actual Haiku spend (higher than $0.50-1.00 guess — prompt grew + provenance + categories increased token cost per extraction; updated estimate **~$2-3 on Haiku for ~280 convs / ~4500 facts**). Paraphrase dedup fired 25+ times, contradiction supersede + fact prune worked across many convs, auto-promote `is_user_self=1` fired in production for the first time, Phase 2 surfaced ~30 review-band proposals. **Predecessor:** Entity-merge Phase 2 shipped 2026-05-12 (commit `9bfda37`) — propose-all-in-band cascade, auto-promote `user_self` via two helpers, runtime config gate `[memory.entity_merge]`, WebUI memory-icon dot indicator + auto-route to Graph tab, gate-timing fix (sweep moved post-relations), Stage 2 substring rescue both forward + reverse. **Predecessor:** Semantic summary adapter + summarize-missing + tuned focus defaults + memory-tool double-dip mitigation shipped 2026-05-11 (commit `c62f4e6`) — Steps 1-3 of a 4-step plan that consolidates summaries as the timeline-of-record source for retrieval. Schema v45 added `memory_summaries.embedding BLOB`; v46 nulled `users.embeddings_model_id` so the recompute worker backfilled all 283 historical summaries on next boot. Step 4 (full re-extract) shipped 2026-05-12.
+**Last updated:** 2026-05-14 (first leader-comparable LoCoMo bench: `recall_generation` 0.679 with-source under Mem0 protocol, 22-24pp below ByteRover/MemMachine/Hindsight. **Metric label correction applied** — prior versions of this file compared `recall_reach` to leaders' generation numbers, which was apples-to-oranges. See Benchmark Position section.). Previously: 2026-05-13 (after **Phase 0 + Phase 1A** shipped — extraction-prompt redesign for paired-output schema and entity-graph 1-hop retrieval at query time, validated together at +13.4pp overall LoCoMo recall_reach and +16.3pp on cat-3 multi-hop.  Two commits, `0cdca08` Phase 0 + `4f8f122` Phase 1A, in order because Phase 1A required Phase 0's dense relation graph to deliver lift.  See Recently shipped row at top of table for full detail).  Previous milestone: **Bundle 3 — memory tool windowed/sorted retrieval** (also 2026-05-13), completing a four-commit memory-subsystem cleanup sequence: Step 4 reextract validation surfaced four issues live; all four shipped 2026-05-12 → 2026-05-13. Bundle 3 closes the LLM-facing tool-surface gaps that surfaced when DAWN self-introspected with "find your oldest memory" — three new params on `recent` (`limit` 1-50, `sort` newest/oldest, `before` for windowed queries), two new `memory_db_*_list_window` functions taking `(since_ts, until_ts, sort_asc, limit)` with `until_ts=0` → INT64_MAX sentinel, four new prepared statements (ASC/DESC × fact/summary). Folded in: `parse_time_period` gained `'y'` (years) support — silently fell through to "no filter" when the LLM tried `time_range:"year"`. Descriptors rewritten to encode the generic principle "query is a window bound, sort orders within the window" so the LLM picks the right window without baked-in recipes. **Live-validated end-to-end** via the original self-introspection — Friday correctly called `recent(query="1y", sort="oldest", limit=1)` after the descriptor refresh and returned ID:5004 from 15 weeks ago (workspace setup + token-streaming schematic conversation, the actual genesis point of the memory tooling). Commit `32861d5`. **Same sequence (2026-05-12 → 2026-05-13):** Bundle 2 (`0e9ae1e`) added equivalence-class stats aggregation — three SELECTs (`entity_get_by_name`, `entity_search`, admin canonical-list) gain correlated subqueries computing SUM(mention_count) / MIN(first_seen) / MAX(last_seen) across `WHERE id = e.id OR canonical_id = e.id`, single-level alias invariant bounds the OR clause to one hop; soft-aliasing "Kris Kersey (88)" → "Kristopher Kersey (10)" now renders the actual class total 277 (= 179 User + 88 Kris + 10 Kristopher) instead of just the canonical's own 10. Bundle 2 also bumped `FACT_MAP_MAX` 32 → 128 (Step 4 surfaced overflow on long convs). Bundle 1 (`ad86629`) wired transient-network HTTP error classification end-to-end through the LLM stack — pre-flight + HTTP {429, 500, 502, 503, 504} all set `LLM_ERR_TRANSIENT_NETWORK`, tool-loop retries with backoff (1s/2s/4s, re-entering rate limit), session_manager distinguishes transient-vs-hard in failure log + WebUI stream-end reason. Bundle 1 also folded in the `relation_supersede` FK violation diagnostic surfaced during Step 4 (`fk_row_exists()` probe on `xrc=787` + defensive `memory_db_fact_get` validation; root cause filed as follow-up TODO). Bug 1 (`af99c4f`) ships the recovery-worker undo path for transient errors so a network blip during reextract doesn't shelve conversations. Bug 2 (`afd0168`) adds `memory_db_entity_upsert_at` so a full reextract preserves entity `first_seen` chronology (now spans Jan-May 2026 instead of all "today"). Plus longer-canonical-name preference for person/pet/place types in entity merge (`ed0067c`, May 12) — Phase 2 follow-up that swaps merge direction when the inbound name has more tokens than the existing canonical. **Step 4 reextract validated end-to-end 2026-05-12**: ran `dawn-admin memory reextract --user admin --confirm` against the 276-conv corpus in 35 minutes / $2.19 actual Haiku spend (higher than $0.50-1.00 guess — prompt grew + provenance + categories increased token cost per extraction; updated estimate **~$2-3 on Haiku for ~280 convs / ~4500 facts**). Paraphrase dedup fired 25+ times, contradiction supersede + fact prune worked across many convs, auto-promote `is_user_self=1` fired in production for the first time, Phase 2 surfaced ~30 review-band proposals. **Predecessor:** Entity-merge Phase 2 shipped 2026-05-12 (commit `9bfda37`) — propose-all-in-band cascade, auto-promote `user_self` via two helpers, runtime config gate `[memory.entity_merge]`, WebUI memory-icon dot indicator + auto-route to Graph tab, gate-timing fix (sweep moved post-relations), Stage 2 substring rescue both forward + reverse. **Predecessor:** Semantic summary adapter + summarize-missing + tuned focus defaults + memory-tool double-dip mitigation shipped 2026-05-11 (commit `c62f4e6`) — Steps 1-3 of a 4-step plan that consolidates summaries as the timeline-of-record source for retrieval. Schema v45 added `memory_summaries.embedding BLOB`; v46 nulled `users.embeddings_model_id` so the recompute worker backfilled all 283 historical summaries on next boot. Step 4 (full re-extract) shipped 2026-05-12.
 
 ---
 
@@ -70,36 +70,67 @@ For the full chronological shipped list (memory + everything else) see `dawn/doc
 
 ## Benchmark position
 
-Two distinct metrics — keep them separate, both matter:
+> **Metric label correction (2026-05-14):** prior versions of this file claimed our `recall_reach` numbers were "within 5pp of ByteRover (92.2%)" etc. **That comparison was wrong.** ByteRover / MemMachine / Hindsight / Mem0 publish LLM-judge generation correctness ("J score"), NOT retrieval reach. Our `recall_reach` is an internal diagnostic — it measures whether top-K retrieval covers gold dialog IDs, not whether the LLM produces the right answer. The only leader-comparable metric is `recall_generation` under the Mem0 protocol (gpt-4o-mini gen+judge, mem0 prompts, with-source, cat-5 excluded). When that protocol is run, the bench tags `leader_comparable: true` in the results JSON. See `dawn/benchmarks/README.md` §"Comparing to published systems" for the canonical run command.
 
-### Retrieval reach (R@K / `recall_reach`)
+Two distinct metrics — both matter; only one is comparable to published leaders:
 
-"Does retrieval surface the right evidence?" — comparable to most published competitor numbers.
+### Retrieval reach (`recall_reach`) — INTERNAL DIAGNOSTIC ONLY
 
-| Metric | DAWN (post-Phase 0 + 1A) | Position |
+"Does retrieval surface the right evidence?" — useful for regression testing across DAWN-internal commits. **NOT directly comparable to ByteRover/MemMachine/Hindsight/Mem0 published numbers** (they publish generation, not reach).
+
+| Metric | DAWN | Use |
 |---|---|---|
-| LongMemEval R@5 | **97.0%** | Leads or matches all published systems. MemPalace's 96.6% is methodology-critiqued. |
-| LoCoMo overall | **87.3%** (was 81.6% pre-Phase-0) | **Within 5pp** of ByteRover (92.2%), MemMachine (91.7%), Hindsight+TEMPR (89.6%). Above Letta 74.0%, Mem0 68.5%. Above human ceiling 87.9. |
-| ConvoMem avg | **99.0%** | Ceiling-level. No higher published. |
-| LoCoMo cat-2 (temporal reach) | **88.8%** (was 84.9%) | Beats Hindsight 83.8%. Temporal-query parser + Phase 0's dense graph compounding. |
-| LoCoMo cat-3 (multi-hop) | **80.6%** (was 64.4%) | **The gap is closing.** Now within 5-11pp of graph competitors (ByteRover 85.1%, MemMachine ~92%). Remaining gap likely needs 2-hop + bitemporal-at-query-time (Phase 2). |
+| LongMemEval R@5 | **97.0%** | Internal regression baseline. (Note: MemPalace etc. publish R@5 too, so for THIS specific R@K metric, comparisons are legitimate.) |
+| LoCoMo overall | **91.7%** (was 87.3% pre-Phase-2.1) | Internal regression baseline. **Do not compare to ByteRover 92.2% / MemMachine 91.2% — those are generation, this is reach.** |
+| ConvoMem avg | **99.0%** | Ceiling-level. |
+| LoCoMo cat-2 (temporal reach) | **92.4%** (was 88.8%) | Internal diagnostic. |
+| LoCoMo cat-3 (multi-hop reach) | **79.5%** (was 80.6%) | Internal diagnostic. Small regression after Phase 2.1 within noise. |
 
-Numbers reflect Phase 0 (extraction-prompt redesign) + Phase 1A (entity-graph 1-hop retrieval) baseline shipped 2026-05-13 (commits `0cdca08` + `4f8f122`).  Pre-Phase-0 numbers in parentheses for delta clarity.  Bench run: `--memory-pipeline --no-cache --temporal-weight 0.20 --proper-noun-boost 1.0 --search-score-floor 0.30` against `~/datasets/locomo/data/locomo10.json`; 1982 QA pairs, 2,736 facts extracted, full result preserved at `benchmarks/bench_phase0_2026-05-13.json` in the dawn repo.  For competitor citations and methodology caveats see [COMPETITOR_LANDSCAPE.md](COMPETITOR_LANDSCAPE.md).  For DAWN's per-benchmark detail tables see [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) §14.3.
+Bench run for current numbers: `--memory-pipeline --config ./dawn.toml --cache-dir ./benchmarks/snapshots_phase2_base` against `~/datasets/locomo/data/locomo10.json` (1982 QA pairs). Full result at `dawn/benchmarks/bench_phase0_2026-05-13.json` (Phase 0+1A baseline) and the unified `memory_search_execute()` retrieval pipeline at commit `f1a4173` (Phase 2 Step 1, bench/prod parity).
 
-### Generation accuracy (`recall_generation`)
+### Generation accuracy (`recall_generation`) — LEADER-COMPARABLE under Mem0 protocol
 
-"Does the LLM produce the right answer given retrieved facts?" — production-faithful, not directly comparable to retrieval-only competitor numbers.
+"Does the LLM produce the right answer given retrieved memory?" — Mem0 protocol matches what ByteRover/MemMachine/Hindsight publish. This is the apples-to-apples comparison.
 
-| Category | Pre-Phase-1 | Phase 1 | **Phase 1.1 (current)** |
+**Current leader-comparable baseline (2026-05-14, full Mem0 protocol with-source):**
+
+| Mode | Overall | cat-1 | cat-2 | cat-3 | cat-4 |
+|---|---|---|---|---|---|
+| `recall_generation` **with-source** (production-faithful, leader-comparable) | **0.679** | 0.691 | 0.623 | 0.511 | 0.715 |
+| `recall_generation` bare-facts (numbered fact list only, NOT leader-comparable) | 0.615 | 0.642 | 0.604 | 0.489 | 0.624 |
+| `recall_entailment` (internal: facts → answer derivable?) | 0.669 | 0.546 | 0.589 | 0.500 | 0.759 |
+
+Cat-5 excluded per Mem0 convention. 1536 QA pairs evaluated. Config: `--memory-pipeline --generator-provider openai --generator-model gpt-4o-mini --judge-provider openai --judge-model gpt-4o-mini --prompt-style mem0 --exclude-categories 5 --with-source`. Results: `dawn/tmp/bench_mem0_ws.json`. Bench tags `leader_comparable: true`.
+
+**Position vs published leaders:**
+
+| System | LoCoMo accuracy | Gap to DAWN |
+|---|---|---|
+| ByteRover 2.0 | 92.2% | +24.3pp |
+| MemMachine v0.2 | 91.2% | +23.3pp |
+| Hindsight (Backboard) | 90.0% | +22.1pp |
+| Hindsight (Gemini-3) | 89.6% | +21.7pp |
+| **DAWN (with-source)** | **67.9%** | — |
+| DAWN (bare-facts, NOT leader-comparable) | 61.5% | (artificial floor) |
+| Letta | 74.0% | +6.1pp ahead of DAWN |
+| Mem0 baseline (self-reported) | 68.5% | within noise of DAWN |
+
+DAWN is meaningfully behind the published leaders on the leader-comparable metric. The gap is NOT in retrieval (0.917 reach = strong) — it's in the chain from retrieved facts/excerpts → LLM-produced answer. Diagnosis: the 24.8pp drop from reach (0.917) → entailment (0.669) shows our extracted facts + source excerpts don't preserve enough of the original dialog for the LLM to derive the gold answer. Leaders likely feed richer context (raw dialog snippets vs our extracted-facts-plus-excerpts), or have better extraction quality, or both. See `dawn/docs/TODO.md` for the workstream candidates that would close this gap.
+
+### Historical generation tracking (extraction-quality regression — different methodology)
+
+These earlier numbers used Anthropic + DAWN's "strict" rubric (not Mem0). Kept for INTERNAL regression tracking across extraction-prompt changes. NOT comparable to published systems.
+
+| Category | Pre-Phase-1 | Phase 1 | Phase 1.1 |
 |---|---|---|---|
-| Overall | 0.208 | 0.279 | **0.371** |
-| Cat-1 (single-hop) | 0.209 | 0.170 (regressed) | **0.316** (recovered + lifted) |
-| Cat-2 (temporal) | 0.022 | 0.321 | **0.492** |
-| Cat-3 (multi-hop) | 0.228 | 0.272 | **0.326** |
-| Cat-4 (knowledge update) | 0.316 | 0.366 | **0.473** |
+| Overall | 0.208 | 0.279 | 0.371 |
+| Cat-1 (single-hop) | 0.209 | 0.170 (regressed) | 0.316 (recovered + lifted) |
+| Cat-2 (temporal) | 0.022 | 0.321 | 0.492 |
+| Cat-3 (multi-hop) | 0.228 | 0.272 | 0.326 |
+| Cat-4 (knowledge update) | 0.316 | 0.366 | 0.473 |
 | Cat-5 (adversarial) | 0.135 | 0.155 | 0.135 (within noise) |
 
-**Cat-2 has a structural ceiling around 0.60** — ~22% of LoCoMo cat-2 questions have non-date gold answers (mis-categorized as cat-2 in the dataset) that no temporal fix can address. Phase 1.1's 0.492 puts the system at ~82% of that ceiling.
+**Cat-2 has a structural ceiling around 0.60** — ~22% of LoCoMo cat-2 questions have non-date gold answers (mis-categorized as cat-2 in the dataset) that no temporal fix can address.
 
 ---
 
