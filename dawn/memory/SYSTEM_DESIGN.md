@@ -157,6 +157,16 @@ model = "qwen2.5:7b"         # Model name for that provider
 
 #### 3.2.1 Four-Model Extraction Sweep (May 2026)
 
+> **Headline-number policy**: numbers in this section (and any other section
+> that cites bench results) are a **snapshot in time**. The single source of
+> truth for the current leader-comparable position lives in
+> [STATE.md](STATE.md) — refresh that file when results move, and treat
+> anything quoted here as a historical comparison point rather than an
+> up-to-date scoreboard. The `recall_reach` numbers in particular are an
+> internal diagnostic metric and are **not directly comparable** to
+> published leader headlines (those are LLM-judge generation under the
+> Mem0 protocol — see `dawn/benchmarks/README.md`).
+
 Full LoCoMo (10 convs, 1982 QA) was run with four extraction models, holding
 embedding model + judge + generator constant at `bge-small-en-v1.5-int8` /
 `claude-haiku-4-5` / `claude-haiku-4-5`:
@@ -559,13 +569,15 @@ For 1,000 document chunks: ~1.5 MB of vector data (trivial)
 
 ## 6. Storage Schema
 
-Using SQLite (already a DAWN dependency for auth). Current schema version: **v46**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
+Using SQLite (already a DAWN dependency for auth). Current schema version: **v48**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
 
 Convention notes:
 - All `created_at` / `last_accessed` / `first_seen` / `last_seen` / `valid_from` / `valid_to` / `linked_at` / `proposed_at` columns are **`INTEGER` Unix epoch seconds**, not SQL `TIMESTAMP`. Defaults are `(strftime('%s','now'))` for "set on insert" columns and literal constants (`0` / `NULL`) for columns added via post-v33 migrations (literal-constant defaults take SQLite's O(1) metadata-only ALTER path — no full-table rewrite under the auth_db lock at startup).
 - All foreign keys to `users(id)` cascade on user delete. Schema text below shows the live database shape; the migration history adds columns one at a time, so column ordering reflects insert-history rather than logical grouping.
 - All "source_*" provenance columns (added v40 / extended v42 in Phase B) point back into `conversations` / `messages` so retrieval can render the original utterance — see [PROVENANCE.md](PROVENANCE.md).
 - v43-v46 add the entity-alias / user-identity / summary-embedding workstream on top of the v33-v42 base. See §6.4 (entities `canonical_id` + `is_user_self`), §6.4.1-§6.4.2 (alias audit log + review-band proposals), §6.3 (`memory_summaries.embedding` BLOB), §6.9 (users `real_name` / `preferred_address` / `identity_aliases`).
+- **v47** adds `memory_facts.subject_entity_id` — a hard FK from each fact to the entity it concerns (Phase 0 extraction-prompt redesign, May 2026; see §6.1). Nullable during transition; backfilled from linked relations on first boot at v47.
+- **v48** adds the `memory_facts_fts` FTS5 virtual table — a contentless BM25 keyword index over Porter2-stemmed fact text (Phase 1 of the Mem0 architectural parity plan, May 2026; see §6.11 and §9.1.1 Search Strategy). Backfilled at migration time; tracked under `[memory] bm25_enabled` (default `false` until Phase 1 is bench-validated end-to-end).
 
 ### 6.1 Memory Facts Table
 
@@ -587,15 +599,21 @@ CREATE TABLE memory_facts (
     source_conversation_id INTEGER DEFAULT NULL,  -- v40 provenance triple
     source_msg_id_start    INTEGER DEFAULT NULL,
     source_msg_id_end      INTEGER DEFAULT NULL,
+    subject_entity_id      INTEGER DEFAULT NULL,  -- v47 — hard FK to subject entity
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (superseded_by) REFERENCES memory_facts(id) ON DELETE SET NULL
+    FOREIGN KEY (superseded_by) REFERENCES memory_facts(id) ON DELETE SET NULL,
+    FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_memory_facts_user           ON memory_facts(user_id);
 CREATE INDEX idx_memory_facts_confidence     ON memory_facts(user_id, confidence DESC);
 CREATE INDEX idx_memory_facts_hash           ON memory_facts(user_id, normalized_hash);
 CREATE INDEX idx_memory_facts_user_category  ON memory_facts(user_id, category);
+CREATE INDEX idx_memory_facts_subject        ON memory_facts(subject_entity_id)
+   WHERE subject_entity_id IS NOT NULL;
 ```
+
+**`subject_entity_id` (v47)** is the Phase 0 extraction-prompt redesign's structural link from fact → entity. The redesigned prompt (May 2026) requires every fact to declare its subject (precedence ladder: `real_name` → named entity → descriptor → `"User"`); the parser resolves the subject string to an entity row before insert and stores the resulting FK here. Pre-v47 facts get backfilled from their linked relations at migration time (`UPDATE memory_facts SET subject_entity_id = (SELECT MIN(r.subject_entity_id) FROM memory_relations r WHERE r.fact_id = id AND r.subject_entity_id IS NOT NULL) WHERE subject_entity_id IS NULL`). Currently NULLABLE; planned to tighten to `NOT NULL` once production telemetry confirms the post-Phase-0 NULL rate stays near zero. The hard FK eliminated the legacy fact↔relation text-matching code (`find_fact_for_relation` retired) and lifted Phase 1A entity-graph retrieval (see §9.1.1) from a side path to the default search posture.
 
 #### 6.1.1 Fact category taxonomy (v34)
 
@@ -894,6 +912,26 @@ CREATE INDEX idx_doc_chunks_doc ON document_chunks(document_id);
 
 `document_chunks.created_at` powers the same temporal-query proximity scoring that facts use — see §7.2 / temporal-weight tuning. `is_global=1` documents are visible to every authenticated user; per-user uploads default to `is_global=0`.
 
+### 6.11 Memory facts BM25 index (v48)
+
+```sql
+CREATE VIRTUAL TABLE memory_facts_fts USING fts5(
+    fact_stems,                            -- pre-stemmed fact_text (Porter2)
+    content='',                            -- contentless — app owns rows
+    tokenize='unicode61 remove_diacritics 2'
+);
+```
+
+`memory_facts_fts` is a contentless FTS5 virtual table backing the BM25 keyword path added in the Mem0 architectural parity work (May 2026). "Contentless" means SQLite stores only the inverted index — the application is responsible for keeping it in sync with `memory_facts` via explicit `INSERT INTO memory_facts_fts(rowid, fact_stems) VALUES (?, ?)` / `DELETE FROM memory_facts_fts WHERE rowid = ?` calls at fact create / supersede / delete time.
+
+**Stemming pre-pass**: each `fact_text` is run through libstemmer (Porter2 English) in C before insert via `memory_stem_text()` in `src/memory/memory_stem.c`. Pre-stemming in C rather than via an FTS5 tokenizer extension keeps the index portable across SQLite builds and lets the same stem helper run on query text at search time. `unicode61` handles diacritic folding; `remove_diacritics 2` is the full NFD-aware variant.
+
+**Backfill**: the v48 migration block walks every existing `memory_facts` row, stems each `fact_text`, and inserts into `memory_facts_fts`. A `v48_ok` guard tracks both `CREATE VIRTUAL TABLE` and backfill success — the version stamp only advances when both have completed, so a transient backfill failure doesn't leave the DB advertised as v48 with a partial index.
+
+**Querying**: BM25 is the first-pass keyword scorer when `[memory] bm25_enabled = true`. Raw `bm25()` scores are normalized to `[0,1]` via a query-length-adaptive sigmoid in `memory_bm25.c` (midpoint + steepness selected from five tiers — short / medium / long / very-long / extreme — adapted from Mem0's `mem0/utils/scoring.py::get_bm25_params` under Apache-2.0; see `NOTICE`). The normalized score blends with the existing semantic-cosine path in the hybrid composite.
+
+See §9.1.1 Search Strategy below for the path through the search dispatcher.
+
 ---
 
 ## 7. Configuration
@@ -1163,13 +1201,18 @@ The LLM translates natural language to these parameters: "last Thursday" → `ti
 - **Provenance optional, never default**: `with_source` is opt-in because verbatim excerpts are token-expensive; the response without `with_source` is what the original LongMemEval / LoCoMo runs measure.
 - **Strbuf-based output**: The action assembles the response in a growable `strbuf_t` (`include/core/strbuf.h`) — no fixed 8 KB ceiling, sticky-OOM, max 256 KiB. Earlier fixed-buffer versions silently truncated when `with_source` budgets exceeded ~3 KB; see [PROVENANCE.md](PROVENANCE.md) §"Strbuf truncation fix."
 
-**Search Strategy** (current implementation, after the v41 hybrid-scoring + temporal-query work):
+**Search Strategy** (current implementation, after v47 Phase 0 + v48 BM25):
 
 1. If `category` is set, pre-filter the candidate fact ID set via SQL `WHERE category = ?` index.
-2. Otherwise, hybrid score: cosine similarity (bge-small-en-v1.5-int8 — see §3.5 / [EMBEDDING_UPGRADE.md](EMBEDDING_UPGRADE.md)) + keyword overlap + temporal-query proximity (when the query contains a temporal expression — `src/core/time_query_parser.c`) + proper-noun boost.
-3. Apply `time_range` window if set (also applied to summaries).
-4. For each top-K matching fact, look up entity links and currently-valid relations (or historical, if `include_historical`).
-5. If `with_source`, batch-fetch provenance via the four sibling readers in `memory_db_provenance.h`: `memory_db_facts_get_sources`, `memory_db_relations_get_sources`, `memory_db_summaries_get_sources`, `memory_db_prefs_get_sources`. Each returns parallel `conv_id` / `msg_id_start` / `msg_id_end` arrays for any positive N (auto-chunked at 32 IDs per SQL pass). Verbatim excerpts append up to the per-call `source_budget_chars` limit.
+2. **Entity-graph grounding (Phase 1A, default-on at v48)**: `memory_graph_retrieval.c` parses proper nouns from the query, resolves them against `memory_entities`, walks `memory_relations` 1-hop, and adds an `entity_grounding_bonus` (default 0.40) to the composite for any fact whose `subject_entity_id` (v47) or relation-graph neighborhood matches a resolved entity. Validated +13.4pp internal `recall_reach` on LoCoMo when shipped (2026-05-13, Phase 0 + Phase 1A); see `[memory.graph_retrieval]` block in `dawn.toml.example`.
+3. **Keyword channel**: when `[memory] bm25_enabled = true`, score keyword overlap via the FTS5 `memory_facts_fts` index (Porter2 stems, sigmoid-normalized — see §6.11). When `false` (default in v1), fall back to the legacy SQL `LIKE` + multi-token match-count path. Same fact ID space; the dispatcher decides which scorer runs.
+4. **Semantic channel**: cosine similarity against fact embeddings (`bge-small-en-v1.5-int8` — see §3.5 / [EMBEDDING_UPGRADE.md](EMBEDDING_UPGRADE.md)).
+5. **Composite + adjustments**: weighted blend of (2) + (3) + (4) plus temporal-query proximity (when the query contains a temporal expression — `src/core/time_query_parser.c`) and the proper-noun boost. The `search_score_floor` knob drops marginal-cosine hits below the floor before they reach the LLM.
+6. Apply `time_range` window if set (also applied to summaries).
+7. For each top-K matching fact, look up entity links and currently-valid relations (or historical, if `include_historical`).
+8. If `with_source`, batch-fetch provenance via the four sibling readers in `memory_db_provenance.h`: `memory_db_facts_get_sources`, `memory_db_relations_get_sources`, `memory_db_summaries_get_sources`, `memory_db_prefs_get_sources`. Each returns parallel `conv_id` / `msg_id_start` / `msg_id_end` arrays for any positive N (auto-chunked at 32 IDs per SQL pass). Source rendering selects the top-K most-relevant messages from the range via case-insensitive (query ∪ fact_text) overlap, re-sorted into original dialog order, header-suppressed if zero messages match — see `memory_callback.c::append_source_excerpt_from_range`. Verbatim excerpts append up to the per-call `source_budget_chars` limit.
+
+The BM25 path is opt-in in v1 because it shipped as a documented experiment ahead of full end-to-end bench-validation under the leader-comparable protocol; expected to default-on once Phase 1 of the Mem0 parity plan is closed. The Phase 1A entity-graph grounding is default-on — see [STATE.md](STATE.md) for the current leader-comparable baseline and the headline-number policy.
 
 **Search Response Format** (text, not JSON — the LLM reads it directly):
 
@@ -1791,6 +1834,27 @@ Per-turn focus block ranks facts / entities / relations / summaries / document c
 - [x] Admin socket opcode `ADMIN_MSG_MEMORY_RECATEGORIZE = 0x80`, fire-and-forget pattern; CAS for TOCTOU race; consecutive-failure abort (3 strikes); injection filter on fact text; `pthread_timedjoin_np` timeout
 - [x] First production run: 99.8% classified (946/948 facts in ~80s)
 
+### Phase 6.16: Phase 0 extraction-prompt redesign + Phase 1A entity-graph retrieval (May 2026, schema v47) ✅ COMPLETE
+
+Coupled work — Phase 0 reshapes extraction to produce a dense relation graph; Phase 1A activates 1-hop entity-graph traversal at retrieval time so the dense graph becomes a default-on retrieval signal.
+
+- [x] **Phase 0 — Extraction**: paired-output JSON schema (relations nested inside each fact, eliminating post-hoc text-matching); required `subject` field with precedence ladder (real_name → named entity → descriptor → "User"); two-tier predicate vocabulary (27 standard Schema.org/ConceptNet types + open snake_case custom); "Previously used relation types" prompt hint built from `memory_db_relation_distinct_predicates`; entities-loop-before-facts-loop parser refactor; legacy `find_fact_for_relation` text-matching retired
+- [x] **Schema v47** — `memory_facts.subject_entity_id` FK column + idx_memory_facts_subject partial index; backfill from linked relations on first boot
+- [x] **New modules** — `memory_predicate_dedup.c/h` (token-Jaccard canonicalizer, 0.66 floor) and `memory_graph_retrieval.c/h` (proper-noun parse → entity resolve → 1-hop walk + grounding bonus)
+- [x] **Phase 1A — Retrieval**: `[memory.graph_retrieval]` config block (enabled=true / entity_grounding_bonus=0.40 / max_facts_per_query=30 / use_query_scoring=true) plumbed through all 7 config surfaces (defaults / parser / validator / env JSON + TOML writer / WebUI POST / settings schema / dawn.toml.example)
+- [x] **Bench-validated** end-to-end on full LoCoMo (1982 QA, 10 convs, 2736-fact fresh corpus): internal `recall_reach` 0.7392 → 0.8733 (+13.4pp); per-category lift +8.3 to +19.0pp across all five categories simultaneously. `recall_reach` is internal-diagnostic only — for leader-comparable position see [STATE.md](STATE.md)
+- [x] Smoke: 100% relation→fact linkage (was 17%); 98.4% subject_entity_id coverage on the fresh corpus
+
+### Phase 6.17: BM25 keyword index (May 2026, schema v48) ✅ SHIPPED (opt-in)
+
+Phase 1 of the Mem0 architectural parity plan — `docs/MEM0_ARCHITECTURAL_PARITY.md` in the dawn repo.
+
+- [x] **Schema v48** — `memory_facts_fts` FTS5 contentless virtual table (`tokenize='unicode61 remove_diacritics 2'`, single `fact_stems` column); v48 migration block creates the table + backfills every existing `memory_facts` row; `v48_ok` guard tracks both CREATE and backfill so a transient backfill failure doesn't advertise a partial index as complete
+- [x] **New modules** — `memory_bm25.c/h` (sigmoid normalization with query-length-adaptive midpoint + steepness across five tiers; adapted from `mem0/utils/scoring.py` under Apache-2.0 — see `NOTICE`) and `memory_stem.c/h` (Porter2 / libstemmer pre-pass)
+- [x] **Sync on writes** — fact create / supersede / delete paths inside `memory_db_facts.c` keep `memory_facts_fts` in sync via explicit `INSERT` / `DELETE` (contentless table — app owns rows)
+- [x] **Config** — `[memory] bm25_enabled` (default `false`); flipping to `true` routes the keyword channel of hybrid search through the FTS5 BM25 path instead of the legacy SQL LIKE + multi-token match-count path
+- [x] **Default-off in v1** — shipped as a documented experiment ahead of the full end-to-end leader-comparable bench gate; expected to default-on once Phase 1 of the parity plan closes
+
 ### S4: Entity Graph ✅ COMPLETE
 
 - [x] Entity types and relation types (`memory_entity_t`, `memory_relation_t`)
@@ -1913,42 +1977,52 @@ Phases 7-11 were implemented as a separate subsystem documented in `docs/RAG_DES
 
 **Summary (May 2026):**
 
-| System                                | Phases       | Status           |
-| ------------------------------------- | ------------ | ---------------- |
-| Memory base (extraction / retrieval)  | 1-6.7        | ✅ Complete      |
-| Entity Graph                          | S4           | ✅ Complete      |
-| Injection Filter                      | S5           | ✅ Complete      |
-| Categorization                        | S6           | ✅ Complete      |
-| Temporal Scoring                      | S7           | ✅ Complete      |
-| Contradiction Detection               | S8           | ✅ Complete      |
-| Entity Merge — soft aliases + Phase 2 | 6.8          | ✅ Complete      |
-| Crash-Recovery Worker                 | 6.9          | ✅ Complete      |
-| Summary Semantic Adapter              | 6.10         | ✅ Complete      |
-| Embedding Recompute + bge-small swap  | 6.11         | ✅ Complete      |
-| Cat-2 Temporal Anchor (Phase 1)       | 6.12         | ✅ Complete      |
-| Memory Provenance (A + B)             | 6.13         | ✅ Complete      |
-| Dynamic Context Injection (Phase 1)   | 6.14         | ✅ Complete      |
-| LLM Recategorization                  | 6.15         | ✅ Complete      |
-| RAG                                   | 7-11         | ✅ Complete      |
-| Per-User Docs                         | 13           | ✅ Shipped       |
-| Cat-2 Temporal Phase 2 (`event_when`) | future       | Re-scoped        |
-| Cross-Encoder Reranker                | future       | Active TODO      |
-| Dynamic Context Injection — Phase 2   | future       | Future           |
-| Speaker ID                            | 12           | Future           |
-| Advanced RAG                          | 14           | Future           |
+| System                                              | Phases       | Status           |
+| --------------------------------------------------- | ------------ | ---------------- |
+| Memory base (extraction / retrieval)                | 1-6.7        | ✅ Complete      |
+| Entity Graph                                        | S4           | ✅ Complete      |
+| Injection Filter                                    | S5           | ✅ Complete      |
+| Categorization                                      | S6           | ✅ Complete      |
+| Temporal Scoring                                    | S7           | ✅ Complete      |
+| Contradiction Detection                             | S8           | ✅ Complete      |
+| Entity Merge — soft aliases + Phase 2               | 6.8          | ✅ Complete      |
+| Crash-Recovery Worker                               | 6.9          | ✅ Complete      |
+| Summary Semantic Adapter                            | 6.10         | ✅ Complete      |
+| Embedding Recompute + bge-small swap                | 6.11         | ✅ Complete      |
+| Cat-2 Temporal Anchor (Phase 1)                     | 6.12         | ✅ Complete      |
+| Memory Provenance (A + B)                           | 6.13         | ✅ Complete      |
+| Dynamic Context Injection (Phase 1)                 | 6.14         | ✅ Complete      |
+| LLM Recategorization                                | 6.15         | ✅ Complete      |
+| Phase 0 Extraction-Prompt Redesign (v47)            | parity-pre   | ✅ Complete      |
+| Phase 1A Entity-Graph Retrieval (default-on)        | parity-pre   | ✅ Complete      |
+| Phase 1 BM25 Keyword Index (v48, opt-in)            | parity-1     | ✅ Shipped       |
+| RAG                                                 | 7-11         | ✅ Complete      |
+| Per-User Docs                                       | 13           | ✅ Shipped       |
+| Cat-2 Temporal Phase 2 (`event_when`)               | future       | Re-scoped        |
+| Cross-Encoder Reranker                              | future       | Dead-lettered    |
+| Dynamic Context Injection — Phase 2                 | future       | Future           |
+| Speaker ID                                          | 12           | Future           |
+| Advanced RAG                                        | 14           | Future           |
+
+Forward-looking phases of the Mem0 architectural parity plan (lemmatization,
+extraction-prompt overhaul, scoring refinements, re-evaluation of disabled
+experimental code) live in `docs/MEM0_ARCHITECTURAL_PARITY.md` in the dawn
+repo — not duplicated here.
 
 ---
 
 ## 12. File Structure
 
-Cross-checked against `ls src/memory/` and `ls include/memory/` at schema v46 (2026-05-13). New modules from the May 2026 ship-velocity (entity-merge alias surface, recovery, recategorize, embed-recompute, filter, provenance, source-dedup, summary backfill, focus adapters, fact search, history loader) are listed inline below. Header-only split (umbrella `memory_db.h` re-exports `memory_db_entities.h` + `memory_db_embeddings.h` + `memory_db_provenance.h` + `memory_db_aliases.h`) shipped 2026-05-08 — external callers compile unchanged.
+Cross-checked against `ls src/memory/`, `ls include/memory/`, and `ls src/core/focus/` at schema v48 (2026-05-16, post-cleanup). The May 2026 cleanup pass folded the monolithic `memory_db.c` (3,800 LOC) and `memory_db_alias.c` (3,800 LOC) into per-record-type modules and moved the trust-boundary focus helpers into a dedicated `src/core/focus/` subdirectory. The umbrella `memory_db.h` still re-exports the split headers so external callers compile unchanged. Six new modules — `memory_bm25.c`, `memory_stem.c`, `memory_score_floor.c`, `memory_source_dedup.c`, `memory_graph_retrieval.c`, `memory_predicate_dedup.c` — landed alongside Phase 0 / Phase 1A / Phase 1 BM25 / score-floor work.
 
 ```
 include/memory/
-├── memory_db.h                  # Umbrella header — re-exports the four split headers below
-├── memory_db_entities.h         # Entity CRUD, upsert, search, soft-link aliases
+├── memory_db.h                  # Umbrella header — re-exports the split headers below
+├── memory_db_internal.h         # Cross-TU helpers shared by the six memory_db_*.c modules
+├── memory_db_entities.h         # Entity CRUD, upsert, search
 ├── memory_db_embeddings.h       # Fact-embedding storage + cache invalidation
 ├── memory_db_aliases.h          # Entity-alias resolver cascade + alias_link/unlink
+├── memory_db_alias_internal.h   # Cross-TU helpers shared by the four memory_db_alias_*.c modules
 ├── memory_db_provenance.h       # Phase B — source-linked recall batch readers
 ├── memory_db_admin.h            # Admin-only DB helpers (bulk delete, recategorize support)
 ├── memory_embeddings.h          # Semantic embedding API (multi-provider, hybrid search)
@@ -1965,19 +2039,25 @@ include/memory/
 ├── memory_recovery.h            # Crash-recovery worker for unconsolidated sessions
 ├── memory_summarize_missing.h   # Backfill summary rows for legacy / failed extractions
 ├── memory_similarity.h          # Duplicate detection API (normalize, hash, Jaccard)
+├── memory_bm25.h                # v48 BM25 sigmoid normalization (mem0-adapted)
+├── memory_stem.h                # Porter2 (libstemmer) pre-pass for FTS5
+├── memory_graph_retrieval.h     # Phase 1A — entity-graph 1-hop retrieval grounding
+├── memory_predicate_dedup.h     # Token-Jaccard canonicalizer for relation predicates
 ├── memory_types.h               # Data structures (fact, pref, summary, entity, relation,
 │                                #   provenance triple, fact-category taxonomy, return codes)
 ├── memory_callback_internal.h   # Internal types shared by memory_callback.c + provenance
-├── focus_candidate_helpers.h    # Shared helpers across focus-block adapters
-├── focus_recency.h              # Temporal-decay scoring for focus-block ranking
-├── focus_source.h               # Source-type taxonomy (INTERNAL / EXTERNAL / USER_CONTENT)
 └── contacts_db.h                # Contact CRUD API (find, add, update, delete, list)
 
 include/core/
 ├── embedding_engine.h           # Shared embedding API (ONNX, Ollama, OpenAI providers)
 ├── time_query_parser.h          # Recognizes temporal expressions in queries (moved from src/tools)
 ├── iso8601.h                    # Canonical ISO 8601 parsing (consolidated April 2026)
-└── strbuf.h                     # Growable string buffer used for memory tool output
+├── strbuf.h                     # Growable string buffer used for memory tool output
+└── focus/
+    ├── focus_candidate_helpers.h  # Shared helpers across focus-block adapters
+    ├── focus_recency.h            # Temporal-decay scoring for focus-block ranking
+    ├── focus_source.h             # Source-type taxonomy (INTERNAL / EXTERNAL / USER_CONTENT)
+    └── focus_dominant_token.h     # Reranker heuristic — over-inclusion dampener
 
 include/tools/
 ├── document_db.h                # Document/chunk CRUD (RAG storage layer)
@@ -1988,47 +2068,68 @@ include/tools/
 └── time_utils.h                 # parse_time_period() — h/m/d/w/y unit parsing
 
 src/memory/
-├── memory_db.c                  # SQLite CRUD, entity upsert, relation create, entity merge,
-│                                #   contradiction detection (EXCLUSIVE_RELATIONS[],
-│                                #   CONTRADICTORY_PAIRS[], memory_db_relation_supersede)
-├── memory_db_alias.c            # Soft-alias resolver cascade (six stages) + scorer +
-│                                #   alias_link/unlink + Phase 2 auto-merge gate
+  # ── Storage (post-Phase-6a split of monolithic memory_db.c, May 2026) ─────────
+├── memory_db.c                  # Core/shared SQLite plumbing, lock, prepared-stmt registry
+├── memory_db_facts.c            # Fact CRUD, hybrid search public entry, subject_entity_id
+├── memory_db_summaries.c        # Summary CRUD + window-list helpers (Bundle 3)
+├── memory_db_entities.c         # Entity CRUD, upsert (with first_seen / last_seen overrides),
+│                                #   equivalence-class read-side aggregation
+├── memory_db_relations.c        # Relation CRUD, bitemporal validity, contradiction detection
+│                                #   (EXCLUSIVE_RELATIONS[], CONTRADICTORY_PAIRS[],
+│                                #   memory_db_relation_supersede)
+├── memory_db_prefs.c            # Preference CRUD + window-list helpers
 ├── memory_db_admin.c            # Admin-only DB helpers (bulk delete by pattern, etc.)
 ├── memory_db_provenance.c       # Phase B — 4 batch source readers + privacy JOIN,
 │                                #   auto-chunked at 32 IDs per SQL pass
-├── memory_embeddings.c          # Embedding cache, hybrid search, cache invalidation
+  # ── Entity-merge alias surface (post-Phase-6b split of monolithic memory_db_alias.c) ─
+├── memory_db_alias.c            # Shared cascade orchestration + public alias entry points
+├── memory_db_alias_scorer.c     # Composite-score helpers (Jaccard, embedding, type, overlap)
+├── memory_db_alias_cascade.c    # Six-stage resolver cascade + Phase 2 auto-merge gate
+├── memory_db_alias_writes.c     # alias_link / alias_unlink / merge / hard-consolidate writes
+  # ── Embedding plumbing ──────────────────────────────────────────────────────
+├── memory_embeddings.c          # Embedding cache, hybrid search dispatch, cache invalidation
 ├── memory_embed_ollama.c        # Ollama embedding provider (/api/embed endpoint)
 ├── memory_embed_openai.c        # OpenAI embedding provider (/v1/embeddings endpoint)
 ├── memory_embed_onnx.c          # ONNX Runtime embedding provider (local)
 ├── memory_embed_recompute.c     # Background re-embed worker, v41 + v46 summary backfill
 ├── memory_embed_tokenizer.c     # WordPiece tokenizer shared with reranker investigation
-├── memory_context.c             # Session-start context builder
-├── memory_callback.c            # LLM tool callback dispatcher (search / remember / forget /
-│                                #   recent + 4 contact actions + merge_entities → alias_link)
+  # ── Retrieval / scoring ─────────────────────────────────────────────────────
+├── memory_fact_search.c         # Hybrid search public surface (extracted from memory_embeddings.c)
+├── memory_bm25.c                # v48 BM25 sigmoid normalization (mem0-adapted, Apache-2.0)
+├── memory_stem.c                # Porter2 (libstemmer) pre-pass feeding memory_facts_fts
+├── memory_score_floor.c         # search_score_floor cut-off applied at memory_fact_search.c
+├── memory_graph_retrieval.c     # Phase 1A — proper-noun parse → entity resolve → 1-hop walk
+├── memory_predicate_dedup.c     # Token-Jaccard canonicalizer for extraction predicates
+├── memory_focus_adapters.c      # Memory-specific focus-block adapters (fact / entity / relation /
+│                                #   summary / chunk) — generic focus primitives now live in src/core/focus/
+├── memory_source_dedup.c        # source_dedup_set_t — suppresses re-fetched provenance
+  # ── Extraction / consolidation ──────────────────────────────────────────────
 ├── memory_extraction.c          # LLM-based extraction: facts, prefs, entities, relations,
 │                                #   summaries, topics; subject-naming + anchor-aware prompt;
 │                                #   Phase 2 gate sweep + auto-promote user_self hooks
-├── memory_fact_search.c         # Hybrid search public surface (extracted from memory_embeddings.c)
-├── memory_filter.c              # Injection-pattern blocklist + Unicode normalization
-├── memory_focus_adapters.c      # Focus-block adapters (fact / entity / relation / summary
-│                                #   / doc_chunk / calendar / user_content) + summary semantic adapter
-├── memory_history_loader.c      # Shared image-strip + history-load for recovery + summarize-missing
-├── memory_maintenance.c         # Nightly decay orchestration
 ├── memory_recategorize.c        # Per-fact LLM recategorization admin command
 ├── memory_recovery.c            # Crash-recovery worker (idle 1h, 24h scan, 5-min timeout)
-├── memory_similarity.c          # Duplicate detection (Jaccard, FNV-1a hashing)
-├── memory_source_dedup.c        # source_dedup_set_t — suppresses re-fetched provenance
 ├── memory_summarize_missing.c   # dawn-admin memory summarize-missing — opcode 0x90
-├── focus_candidate_helpers.c    # Shared helpers across focus-block adapters
-├── focus_recency.c              # Temporal-decay scoring used inside the focus-block adapters
-├── focus_source.c               # Source-type tagging for trust-boundary filter routing
+├── memory_history_loader.c      # Shared image-strip + history-load for recovery + summarize-missing
+  # ── Misc ────────────────────────────────────────────────────────────────────
+├── memory_context.c             # Session-start context builder
+├── memory_callback.c            # LLM tool callback dispatcher (search / remember / forget /
+│                                #   recent + 4 contact actions + merge_entities → alias_link)
+├── memory_filter.c              # Injection-pattern blocklist + Unicode normalization
+├── memory_similarity.c          # Duplicate detection (Jaccard, FNV-1a hashing)
+├── memory_maintenance.c         # Nightly decay orchestration
 └── contacts_db.c                # Contact CRUD (find, add, update, delete, list)
 
 src/core/
 ├── embedding_engine.c           # Provider-agnostic embedding + vector math
 ├── time_query_parser.c          # Layer 1 temporal-expression recognizer
 ├── iso8601.c                    # Canonical ISO 8601 parsing
-└── strbuf.c                     # Growable string buffer (256 KiB cap, sticky-OOM)
+├── strbuf.c                     # Growable string buffer (256 KiB cap, sticky-OOM)
+└── focus/                       # Post-Phase-6c move — trust-boundary helpers leave src/memory/
+    ├── focus_source.c           # Source-type tagging for trust-boundary filter routing
+    ├── focus_recency.c          # Temporal-decay scoring inside the focus-block adapters
+    ├── focus_dominant_token.c   # Reranker heuristic — over-inclusion dampener
+    └── focus_candidate_helpers.c  # Shared helpers across focus-block adapters
 
 src/tools/
 ├── document_db.c                # SQLite CRUD for documents and chunks
