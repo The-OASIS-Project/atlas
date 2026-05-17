@@ -1847,7 +1847,7 @@ Coupled work — Phase 0 reshapes extraction to produce a dense relation graph; 
 
 ### Phase 6.17: BM25 keyword index (May 2026, schema v48) ✅ SHIPPED (opt-in)
 
-Phase 1 of the Mem0 architectural parity plan — `docs/MEM0_ARCHITECTURAL_PARITY.md` in the dawn repo.
+Phase 1 of the Mem0 architectural parity plan — see [MEM0_ARCHITECTURAL_PARITY.md](MEM0_ARCHITECTURAL_PARITY.md) (sealed historical reference for the closed program).
 
 - [x] **Schema v48** — `memory_facts_fts` FTS5 contentless virtual table (`tokenize='unicode61 remove_diacritics 2'`, single `fact_stems` column); v48 migration block creates the table + backfills every existing `memory_facts` row; `v48_ok` guard tracks both CREATE and backfill so a transient backfill failure doesn't advertise a partial index as complete
 - [x] **New modules** — `memory_bm25.c/h` (sigmoid normalization with query-length-adaptive midpoint + steepness across five tiers; adapted from `mem0/utils/scoring.py` under Apache-2.0 — see `NOTICE`) and `memory_stem.c/h` (Porter2 / libstemmer pre-pass)
@@ -2004,10 +2004,13 @@ Phases 7-11 were implemented as a separate subsystem documented in `docs/RAG_DES
 | Speaker ID                                          | 12           | Future           |
 | Advanced RAG                                        | 14           | Future           |
 
-Forward-looking phases of the Mem0 architectural parity plan (lemmatization,
-extraction-prompt overhaul, scoring refinements, re-evaluation of disabled
-experimental code) live in `docs/MEM0_ARCHITECTURAL_PARITY.md` in the dawn
-repo — not duplicated here.
+Phases 2-4 of the Mem0 architectural parity plan (scoring refinements,
+extraction-prompt overhaul, re-evaluation of disabled experimental code)
+have run their bench gates and are archived in
+[MEM0_ARCHITECTURAL_PARITY.md](MEM0_ARCHITECTURAL_PARITY.md) — sealed
+historical reference, program complete 2026-05-17.  Phase 3 partial
+shipped (specificity rules); Phase 2 reverted; Phase 4A RRF dead-letter;
+Phase 4B `memory_text_minimal` confirmed.
 
 ---
 
