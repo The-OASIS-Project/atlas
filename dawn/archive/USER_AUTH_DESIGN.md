@@ -219,16 +219,16 @@ Confirm password: ********
 Admin account 'operator' created successfully.
 
 # Create regular user
-$ dawn-admin user create kris
+$ dawn-admin user create jon
 Password: ********
 Confirm password: ********
-User 'kris' created successfully.
+User 'jon' created successfully.
 
 # List users
 $ dawn-admin user list
 ID  Username  Role   Created              Last Login
 1   admin     Admin  2024-12-18 10:00:00  2024-12-18 14:30:00
-2   kris      User   2024-12-18 11:00:00  Never
+2   jon      User   2024-12-18 11:00:00  Never
 
 # Delete user
 $ dawn-admin user delete olduser
@@ -255,7 +255,7 @@ $ dawn-admin session list
 Token       User   IP             Last Activity  Created
 --------    -----  -------------  -------------  -------------------
 a1b2c3d4..  admin  192.168.1.10   5m ago         2024-12-18 10:00:00
-e5f6g7h8..  kris   192.168.1.20   1h ago         2024-12-18 09:30:00
+e5f6g7h8..  jon   192.168.1.20   1h ago         2024-12-18 09:30:00
 
 # Revoke specific session by token prefix
 $ dawn-admin session revoke a1b2c3d4
@@ -263,9 +263,9 @@ Admin password: ********
 Session revoked.
 
 # Revoke all sessions for a user
-$ dawn-admin session revoke --user kris
+$ dawn-admin session revoke --user jon
 Admin password: ********
-2 sessions revoked for user 'kris'.
+2 sessions revoked for user 'jon'.
 ```
 
 #### Device Token Management (Mode 2 Critical)
@@ -739,7 +739,7 @@ LLM-generated commands are validated against `commands_config_nuevo.json`:
 When user authentication is implemented, extend device access control:
 
 ```toml
-# users/kris.toml - Per-user device restrictions
+# users/jon.toml - Per-user device restrictions
 [device_access]
 # Allowlist mode: only these devices can be controlled
 allowed_devices = ["lights", "music", "volume", "stream"]
@@ -1453,8 +1453,8 @@ Browser                              Server
 
 ```json
 // Already authenticated via cookie, but can also login via WS:
-{"type": "login", "username": "kris", "password": "..."}
-{"type": "login_response", "success": true, "username": "kris", "is_admin": false}
+{"type": "login", "username": "jon", "password": "..."}
+{"type": "login_response", "success": true, "username": "jon", "is_admin": false}
 
 {"type": "logout"}
 {"type": "logout_response", "success": true}
@@ -1467,7 +1467,7 @@ Browser                              Server
 {"type": "get_users"}
 {"type": "get_users_response", "users": [
    {"username": "admin", "is_admin": true, "created": "...", "last_login": "..."},
-   {"username": "kris", "is_admin": false, "created": "...", "last_login": "..."}
+   {"username": "jon", "is_admin": false, "created": "...", "last_login": "..."}
 ]}
 
 // Create user
@@ -1479,7 +1479,7 @@ Browser                              Server
 {"type": "delete_user_response", "success": true}
 
 // Change password (admin can change any, user can change own)
-{"type": "change_password", "username": "kris", "new_password": "..."}
+{"type": "change_password", "username": "jon", "new_password": "..."}
 {"type": "change_password_response", "success": true}
 ```
 
@@ -2288,7 +2288,7 @@ Admin-only section in existing settings panel.
 |  admin                              [Admin]    |
 |  Last login: 2 hours ago                       |
 |  ─────────────────────────────────────────     |
-|  kris                                          |
+|  jon                                          |
 |  Last login: Yesterday                         |
 |                               [Reset] [Delete] |
 +------------------------------------------------+
@@ -2411,7 +2411,7 @@ Available to all logged-in users for changing own password and personal settings
 +------------------------------------------------+
 |  YOUR PROFILE                                  |
 |------------------------------------------------|
-|  Username: kris                                |
+|  Username: jon                                |
 |                                                |
 |  Change Password                               |
 |  ─────────────────────────────────────────     |
@@ -2446,7 +2446,7 @@ Uses existing settings-section styling.
 
   <!-- NEW: User indicator -->
   <div id="user-indicator">
-    <span id="current-user">kris</span>
+    <span id="current-user">jon</span>
     <button id="logout-btn" title="Logout">
       <svg><!-- Logout icon --></svg>
     </button>
@@ -4371,14 +4371,14 @@ sqlite3_finalize(stmt);
 All authentication events should be logged for security monitoring:
 
 ```
-[2025-01-15 10:23:45] AUTH LOGIN_SUCCESS user=kris ip=192.168.1.50 session=a7b3...
+[2025-01-15 10:23:45] AUTH LOGIN_SUCCESS user=jon ip=192.168.1.50 session=a7b3...
 [2025-01-15 10:24:12] AUTH LOGIN_FAILED user=admin ip=192.168.1.99 reason=bad_password
 [2025-01-15 10:24:13] AUTH LOGIN_FAILED user=admin ip=192.168.1.99 reason=bad_password
 [2025-01-15 10:24:14] AUTH LOCKOUT user=admin ip=192.168.1.99 duration=15m
-[2025-01-15 10:30:00] AUTH LOGOUT user=kris session=a7b3...
-[2025-01-15 11:00:00] AUTH SESSION_EXPIRED user=kris session=a7b3...
+[2025-01-15 10:30:00] AUTH LOGOUT user=jon session=a7b3...
+[2025-01-15 11:00:00] AUTH SESSION_EXPIRED user=jon session=a7b3...
 [2025-01-15 14:00:00] AUTH USER_CREATED user=newuser by=admin
-[2025-01-15 14:05:00] AUTH PASSWORD_CHANGED user=kris by=kris
+[2025-01-15 14:05:00] AUTH PASSWORD_CHANGED user=jon by=jon
 [2025-01-15 14:10:00] AUTH USER_DELETED user=olduser by=admin
 ```
 

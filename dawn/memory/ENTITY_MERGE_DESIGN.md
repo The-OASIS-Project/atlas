@@ -13,18 +13,18 @@ The memory subsystem treats different surface forms of the same real-world entit
 | id | name | entity_type | canonical_name | mention_count | outgoing relations |
 |----|------|-------------|----------------|---------------|---------------------|
 | 1162 | `user` | thing | `user` | 292 | 292 |
-| 1230 | `Kris` | thing | `kris` | 28 | 59 |
-| 1406 | `Kristopher Kersey` | person | `kristopher kersey` | 21 | 45 |
+| 1230 | `Jon` | thing | `jon` | 28 | 59 |
+| 1406 | `Jonathan Smith` | person | `jonathan smith` | 21 | 45 |
 | 1735 | `kerseyfabrications` | thing | `kerseyfabrications` | 1 | — |
 | 1747 | `kerseyfabrications@gmail.com` | thing | `kerseyfabrications@gmail.com` | 1 | — |
 
 All five refer to the same person. Consequences observed in production:
 
-1. **Relation duplication.** "Kris works_at FOO" and "Kristopher Kersey works_at FOO" are stored as two `memory_relations` rows with different `subject_entity_id` values. 396 outgoing relations are split across the three primary aliases (292 + 59 + 45) instead of consolidated under one canonical subject.
-2. **Search fragmentation.** `memory_action_search` for "where does Kris work" hits one entity; "where does Kristopher work" misses (or vice versa).
+1. **Relation duplication.** "Jon works_at FOO" and "Jonathan Smith works_at FOO" are stored as two `memory_relations` rows with different `subject_entity_id` values. 396 outgoing relations are split across the three primary aliases (292 + 59 + 45) instead of consolidated under one canonical subject.
+2. **Search fragmentation.** `memory_action_search` for "where does Jon work" hits one entity; "where does Jonathan work" misses (or vice versa).
 3. **Confidence dilution.** Facts attached to different aliases never aggregate; nightly decay treats them independently.
-4. **Contradiction-detection blind spot.** `memory_db_relation_supersede()` matches on `subject_entity_id` — `Kris works_at FOO` (open) and `Kristopher Kersey works_at BAR` (open) coexist forever because no `EXCLUSIVE_RELATIONS[]` row sees them as the same subject.
-5. **Per-turn focus block.** Phase 1f's `memory_focus_adapters` lists each alias as an independent candidate, so a single conversational turn about "where does Kris work" can produce both "Kris → works_at → FOO" and "Kristopher Kersey → works_at → FOO" cards in the user-visible focus injection block. The user sees their own duplication every turn the focus block fires.
+4. **Contradiction-detection blind spot.** `memory_db_relation_supersede()` matches on `subject_entity_id` — `Jon works_at FOO` (open) and `Jonathan Smith works_at BAR` (open) coexist forever because no `EXCLUSIVE_RELATIONS[]` row sees them as the same subject.
+5. **Per-turn focus block.** Phase 1f's `memory_focus_adapters` lists each alias as an independent candidate, so a single conversational turn about "where does Jon work" can produce both "Jon → works_at → FOO" and "Jonathan Smith → works_at → FOO" cards in the user-visible focus injection block. The user sees their own duplication every turn the focus block fires.
 
 The same shape applies to non-user entities ("Mom" vs "Melanie", "the cat" vs "Sasha") but at lower volume — non-user entities tend to use a smaller vocabulary per conversation.
 
@@ -205,7 +205,7 @@ if (was_created && eid > 0) {
 
 The `_resolve_alias` function does all the work in §6. The `_consider_auto_merge` function runs the full composite scorer against existing entities and either soft-links (composite ≥ auto threshold), queues a proposal (review band), or no-ops. Threshold defaults are configurable per §7; first-ship values are conservative (0.90 / 0.70) pending Phase 2 corpus calibration.
 
-The local `entity_map` cache inside `process_extraction_response` (the per-call dedup at `memory_extraction.c:609`) keeps working as-is — it's a within-extraction-call dedup. The resolver supersedes the cross-conversation dedup gap that today produces fresh `Kris`/`Kristopher Kersey` duplicates from each new conversation.
+The local `entity_map` cache inside `process_extraction_response` (the per-call dedup at `memory_extraction.c:609`) keeps working as-is — it's a within-extraction-call dedup. The resolver supersedes the cross-conversation dedup gap that today produces fresh `Jon`/`Jonathan Smith` duplicates from each new conversation.
 
 ### Embedding generation order
 
@@ -244,7 +244,7 @@ Three places in `src/memory/memory_callback.c` need alias-aware lookup:
 
 ### Focus block (`memory_focus_adapters.c`)
 
-The entity adapter (`memory_focus_adapters.c:s_entity_scratch`) loads entities + embeddings into a 256-row scratch buffer. After the change: the loader filters `WHERE canonical_id IS NULL` so aliases are absent from the scratch buffer entirely. This is the single biggest user-visible win — the per-turn focus block stops showing "Kris" and "Kristopher Kersey" as separate cards.
+The entity adapter (`memory_focus_adapters.c:s_entity_scratch`) loads entities + embeddings into a 256-row scratch buffer. After the change: the loader filters `WHERE canonical_id IS NULL` so aliases are absent from the scratch buffer entirely. This is the single biggest user-visible win — the per-turn focus block stops showing "Jon" and "Jonathan Smith" as separate cards.
 
 The relation adapter follows the same path: relations are listed against canonical entity_ids only (using `_list_by_subject_class`). Aliases' relations surface through their canonical's listing.
 
@@ -282,9 +282,9 @@ The only meaningful new cost is the extraction-time resolver — which happens a
 
 **Stage 1**: if `memory_make_canonical_name(name)` matches an existing `canonical_name`, return that entity's `COALESCE(canonical_id, id)`. This is the fast path for repeat mentions of the same surface form — the dominant case after the first conversation establishes an entity.
 
-**Stage 2**: split `canonical_name` on whitespace and ASCII punctuation; for each token of length ≥ 2, run `memory_db_entity_search(user_id, token, …)` (existing LIKE-based keyword search). Aggregate up to 32 unique candidate IDs. Compute `name_jaccard = |tokens_a ∩ tokens_b| / |tokens_a ∪ tokens_b|` per candidate; drop those below 0.30. The 0.30 floor catches "Kris"/"Kristopher Kersey" (Jaccard = 1/2 = 0.50) but rejects accidental token sharing ("Kris" vs "Krispy Kreme" → 0.33; passes Stage 2 but Stage 3 catches the type/content mismatch in later stages).
+**Stage 2**: split `canonical_name` on whitespace and ASCII punctuation; for each token of length ≥ 2, run `memory_db_entity_search(user_id, token, …)` (existing LIKE-based keyword search). Aggregate up to 32 unique candidate IDs. Compute `name_jaccard = |tokens_a ∩ tokens_b| / |tokens_a ∪ tokens_b|` per candidate; drop those below 0.30. The 0.30 floor catches "Jon"/"Jonathan Smith" (Jaccard = 1/2 = 0.50) but rejects accidental token sharing ("Jon" vs "Krispy Kreme" → 0.33; passes Stage 2 but Stage 3 catches the type/content mismatch in later stages).
 
-**Stage 3**: drop candidates whose `entity_type` mismatches the inbound entity's type, EXCEPT when one side is `thing`. The `thing` carve-out exists because the live DB has `Kris` extracted as `thing` and `Kristopher Kersey` as `person` — the LLM is inconsistent about person/thing classification, and a strict type match would block the obvious correct merge. `thing` matches everything; person/place/pet/org must agree.
+**Stage 3**: drop candidates whose `entity_type` mismatches the inbound entity's type, EXCEPT when one side is `thing`. The `thing` carve-out exists because the live DB has `Jon` extracted as `thing` and `Jonathan Smith` as `person` — the LLM is inconsistent about person/thing classification, and a strict type match would block the obvious correct merge. `thing` matches everything; person/place/pet/org must agree.
 
 **Stage 4**: embed the inbound `canonical_name` via the existing engine (one call, ~2ms on bge-small-en-v1.5-int8). The embedding is reused for the new entity's `embedding` column if a fresh row ends up created. Cosine is computed against each Stage-3 survivor's stored embedding. The candidate pool is RAM-resident: the resolver reuses the existing `s_entity_cache` in `memory_embeddings.c` (already loaded for `memory_embeddings_entity_search`). No DB hit per candidate. Drop candidates with cosine < 0.50.
 
@@ -332,10 +332,10 @@ Sum of weights = 1.0; composite ∈ [0, 1].
 
 Applied AFTER the weighted sum:
 
-- **`name_substring_bonus = +0.10`** when one canonical_name is a strict substring of the other (e.g. "kris" ⊂ "kristopher kersey"). The bonus boosts cases where one name is a strict substring of another, on top of any token Jaccard signal — both lighting on shared-token evidence is intentional, rewarding the case where two name signals agree.
+- **`name_substring_bonus = +0.10`** when one canonical_name is a strict substring of the other (e.g. "jon" ⊂ "jonathan smith"). The bonus boosts cases where one name is a strict substring of another, on top of any token Jaccard signal — both lighting on shared-token evidence is intentional, rewarding the case where two name signals agree.
 - **`user_self_bonus = +0.20`** when one side is the seeded user-self entity (`is_user_self = 1`) AND the other has user-identity signal: matches `users.username`, OR an existing seeded alias substring, OR an `email_is` open exclusive relation pointing at a known account email.
 
-The user-self bonus is what lets `user` (id 1162, type=thing, mention_count=292) cluster with the seeded `Kristopher Kersey` (canonical, type=person) despite the otherwise-weak signal between a generic noun ("user") and a proper name. Without it, the developer's existing 292-relation `user` row would never auto-link.
+The user-self bonus is what lets `user` (id 1162, type=thing, mention_count=292) cluster with the seeded `Jonathan Smith` (canonical, type=person) despite the otherwise-weak signal between a generic noun ("user") and a proper name. Without it, the developer's existing 292-relation `user` row would never auto-link.
 
 ### Threshold bands
 
@@ -393,17 +393,17 @@ The `is_user_self = 1` flag is what `canonical_priority` (§9) reads to give the
 A new admin command `dawn-admin memory entity link-user-self [--username <u>] [--dry-run]`:
 
 1. **Find or create the user-self canonical.** Search existing entities for the best resolver match against `(username, persona_description)`:
-   - If any existing entity scores composite ≥ auto-merge threshold (default 0.90, with the user-self bonus computed against itself, equivalent to the entity-as-canonical case), USE that entity as canonical and set `is_user_self = 1` on it. This is the dev's expected case — `Kristopher Kersey` (id=1406, type=person, 21 mentions) should match strongly enough to be promoted to user-self.
+   - If any existing entity scores composite ≥ auto-merge threshold (default 0.90, with the user-self bonus computed against itself, equivalent to the entity-as-canonical case), USE that entity as canonical and set `is_user_self = 1` on it. This is the dev's expected case — `Jonathan Smith` (id=1406, type=person, 21 mentions) should match strongly enough to be promoted to user-self.
    - Else, create a fresh seed entity per Path A.
 2. **Run resolver across all entities** for that user_id, treating the user-self as an always-present additional candidate (with `user_self_bonus` applied).
 3. **For each candidate scoring ≥ auto-merge threshold**: insert a soft link (set `canonical_id` + audit row, `reason='operator'` if dry-run was confirmed).
 4. **For candidates in the review band**: enqueue in `memory_entity_merge_proposals` for the operator to review later via WebUI.
 5. **Print report**: for the dev, expected output is something like:
    ```
-   user-self canonical: Kristopher Kersey (id=1406)
+   user-self canonical: Jonathan Smith (id=1406)
 
    Auto-merged (composite ≥ 0.90):
-     1230 'Kris' (thing)              → composite 0.91 (substring + works_at-overlap + user_self_bonus)
+     1230 'Jon' (thing)              → composite 0.91 (substring + works_at-overlap + user_self_bonus)
      1162 'user' (thing)              → composite 0.95 (email_is overlap + 292-mention authority + user_self_bonus)
      1747 'kerseyfabrications@gmail.com' (thing) → composite 0.92 (email_is exclusive-relation match + user_self_bonus)
 
@@ -437,11 +437,11 @@ canonical_priority(entity) = (
 )
 ```
 
-For the dev's cluster after seeding: `Kristopher Kersey` wins via `is_user_self=1` first criterion. No other entity has that flag for user_id=1, so the comparison short-circuits.
+For the dev's cluster after seeding: `Jonathan Smith` wins via `is_user_self=1` first criterion. No other entity has that flag for user_id=1, so the comparison short-circuits.
 
 ### Resolver runs against full entity set, not visit-state
 
-The resolver loads ALL existing entities for the user from cache before scoring. It doesn't matter whether the new mention "Krys" arrives before or after "Kris" and "Kristopher Kersey" exist as rows — the canonical it picks is determined by `canonical_priority` against the existing rows visible at resolver time. If the existing rows haven't been linked yet (e.g. a previous extraction lacked sufficient evidence), then "Krys" lands as a new row and contributes to the cluster; the next resolver invocation that has all three plus their relations evaluates the cluster identically regardless of which one arrived last.
+The resolver loads ALL existing entities for the user from cache before scoring. It doesn't matter whether the new mention "Krys" arrives before or after "Jon" and "Jonathan Smith" exist as rows — the canonical it picks is determined by `canonical_priority` against the existing rows visible at resolver time. If the existing rows haven't been linked yet (e.g. a previous extraction lacked sufficient evidence), then "Krys" lands as a new row and contributes to the cluster; the next resolver invocation that has all three plus their relations evaluates the cluster identically regardless of which one arrived last.
 
 ### Tiebreaks are stable across reextract
 
@@ -498,7 +498,7 @@ The existing primitive's dedup handles exact duplicates (same `subject`, `relati
 
 ### Fact-text references
 
-`memory_facts.fact_text` references entities by string name, not FK. Rewriting "Kris works at FOO" → "Kristopher Kersey works at FOO" is lossy (loses user's original phrasing). **No-op: do not rewrite.** Search relies on the entity-graph merge to bridge during retrieval — the query "where does Kris work" hits `memory_embeddings_entity_search` which now resolves to canonical and surfaces facts attached to the canonical's relations. Fact text retains its original phrasing for provenance fidelity.
+`memory_facts.fact_text` references entities by string name, not FK. Rewriting "Jon works at FOO" → "Jonathan Smith works at FOO" is lossy (loses user's original phrasing). **No-op: do not rewrite.** Search relies on the entity-graph merge to bridge during retrieval — the query "where does Jon work" hits `memory_embeddings_entity_search` which now resolves to canonical and surfaces facts attached to the canonical's relations. Fact text retains its original phrasing for provenance fidelity.
 
 ---
 
@@ -607,7 +607,7 @@ This is what `dawn-admin memory entity history <entity_id>` and the WebUI "why w
 
 1. **`get_entity_aliases`** (request) → **`entity_aliases_response`** (response):
    - Request: `{type: "get_entity_aliases", entity_id: 1406}`
-   - Response: `{type: "entity_aliases_response", entity_id: 1406, aliases: [{alias_entity_id: 1230, name: "Kris", canonical_name: "kris", entity_type: "thing", mention_count: 28, link_id: 42, linked_at: 1746000000, link_kind: "soft", composite_score: 0.91}, ...]}`
+   - Response: `{type: "entity_aliases_response", entity_id: 1406, aliases: [{alias_entity_id: 1230, name: "Jon", canonical_name: "jon", entity_type: "thing", mention_count: 28, link_id: 42, linked_at: 1746000000, link_kind: "soft", composite_score: 0.91}, ...]}`
    - Used by Graph tab on entity-card expand to show nested aliases.
 
 2. **`split_entity_alias`** (request) → **`split_entity_alias_response`**:
@@ -641,9 +641,9 @@ This is what `dawn-admin memory entity history <entity_id>` and the WebUI "why w
 
 **Behavior change to existing `merge_entities` LLM tool action and WebUI two-click**: both default to **soft merge** (set `canonical_id` + audit row, source row present). Hard merge is operator-only via `dawn-admin memory entity consolidate`. The WebUI surface explains this in the merge confirm dialog: "The source entity will be marked as an alias of the target. You can split it later. Use `dawn-admin memory entity consolidate` to make this permanent."
 
-**Post-Phase-2 purpose of the LLM `merge_entities` action**: once Phase 2's auto-merge gate is live, the resolver handles high-composite cases automatically at extraction time. The LLM tool action remains valuable for cases the gate didn't fire on — e.g. the resolver scored a pair in the 0.70–0.90 review band and queued a proposal, but the LLM has additional context from the current conversation that establishes equivalence (a user explicitly says "Kris and Kristopher are the same person"). The LLM action **bypasses the proposal queue** with explicit LLM judgment, soft-linking directly. This positions the action as the LLM's escape hatch for mid-confidence cases the operator hasn't reviewed yet.
+**Post-Phase-2 purpose of the LLM `merge_entities` action**: once Phase 2's auto-merge gate is live, the resolver handles high-composite cases automatically at extraction time. The LLM tool action remains valuable for cases the gate didn't fire on — e.g. the resolver scored a pair in the 0.70–0.90 review band and queued a proposal, but the LLM has additional context from the current conversation that establishes equivalence (a user explicitly says "Jon and Jonathan are the same person"). The LLM action **bypasses the proposal queue** with explicit LLM judgment, soft-linking directly. This positions the action as the LLM's escape hatch for mid-confidence cases the operator hasn't reviewed yet.
 
-The LLM tool action's response text changes: `"Linked 'Kris' as an alias of 'Kristopher Kersey'. The 'Kris' entity is now a soft alias and will be resolved to 'Kristopher Kersey' on lookup. Use 'split' to undo."`
+The LLM tool action's response text changes: `"Linked 'Jon' as an alias of 'Jonathan Smith'. The 'Jon' entity is now a soft alias and will be resolved to 'Jonathan Smith' on lookup. Use 'split' to undo."`
 
 ### Phase 2 — `dawn-admin memory entity` subcommands
 
@@ -772,17 +772,17 @@ Includes:
 
 Phase 2 landed in one commit covering the full gate surface — auto-merge at extraction, runtime config, WebUI proposal indicator, and operator review flow. The shipped behavior diverged from the original §17 outline in five places worth recording for future workstreams (Phase 3 hard-merge, threshold recalibration, cross-encoder reranker, anchor-aware resolver).
 
-1. **Propose-all-in-band was an addition not in the original spec.** Original spec described single-winner-per-source: cascade picks the best Stage-6 candidate, routes to AUTO/REVIEW/no-op once. Shipped behavior: `cascade_internal` now optionally populates an array of every Stage-6-scored candidate, sorted by composite DESC. `consider_auto_merge` iterates that list — AUTO short-circuits when the top winner reaches `auto_threshold` (source becomes a soft alias, sole outcome), otherwise EVERY candidate at or above `review_threshold` produces a separate proposal row. Rationale: false-positive cost is one operator click in the WebUI; false-miss cost is a duplicate entity that survives extraction and persists. Live-validated on the dev's cluster — Kristopher Kersey legitimately matched both Kris (correct, accepted) and Shelley Kersey (shared "kersey" token, false positive, rejected). Both surfaced as expected; the prior winner-only path would have hidden one or the other depending on which composite ranked higher.
+1. **Propose-all-in-band was an addition not in the original spec.** Original spec described single-winner-per-source: cascade picks the best Stage-6 candidate, routes to AUTO/REVIEW/no-op once. Shipped behavior: `cascade_internal` now optionally populates an array of every Stage-6-scored candidate, sorted by composite DESC. `consider_auto_merge` iterates that list — AUTO short-circuits when the top winner reaches `auto_threshold` (source becomes a soft alias, sole outcome), otherwise EVERY candidate at or above `review_threshold` produces a separate proposal row. Rationale: false-positive cost is one operator click in the WebUI; false-miss cost is a duplicate entity that survives extraction and persists. Live-validated on the dev's cluster — Jonathan Smith legitimately matched both Jon (correct, accepted) and Dawn Smith (shared "smith" token, false positive, rejected). Both surfaced as expected; the prior winner-only path would have hidden one or the other depending on which composite ranked higher.
 
-2. **Gate timing moved from inline-during-entity-upsert to post-relations sweep.** Original spec wired the gate inline during the entity loop in `process_extraction_response`. Shipped behavior: new `apply_phase2_merge_gate()` helper in `memory_extraction.c` tracks `fresh_entity_ids[ENTITY_MAP_MAX]` of newly-created entities and runs the cascade AFTER the relations loop completes. Reason: inline scoring saw `exclusive_relation_overlap = 0` for every candidate because relations had not yet been processed — Stage 2 substring rescue found `Kris ⊂ Kristopher Kersey` as a candidate, but composite stayed below threshold without the dominant relation-overlap signal. Broadcast to clients was also coalesced to a single fire-at-end (was per-proposal, which thrashed the DB lock and the WebUI memory-icon dot animation when multiple proposals fired in one extraction).
+2. **Gate timing moved from inline-during-entity-upsert to post-relations sweep.** Original spec wired the gate inline during the entity loop in `process_extraction_response`. Shipped behavior: new `apply_phase2_merge_gate()` helper in `memory_extraction.c` tracks `fresh_entity_ids[ENTITY_MAP_MAX]` of newly-created entities and runs the cascade AFTER the relations loop completes. Reason: inline scoring saw `exclusive_relation_overlap = 0` for every candidate because relations had not yet been processed — Stage 2 substring rescue found `Jon ⊂ Jonathan Smith` as a candidate, but composite stayed below threshold without the dominant relation-overlap signal. Broadcast to clients was also coalesced to a single fire-at-end (was per-proposal, which thrashed the DB lock and the WebUI memory-icon dot animation when multiple proposals fired in one extraction).
 
 3. **Two auto-promote helpers replaced the CLI-only flow.** Original spec made `dawn-admin memory entity link-user-self` the required first-run setup step (§8 Path A / Path B). Shipped behavior: `memory_db_entity_maybe_auto_promote_user_self()` fires inline at extraction when a fresh entity's canonical_name matches `users.real_name` AND no user_self anchor exists yet for that user; `memory_db_entity_auto_promote_user_self_by_real_name()` runs as a sweep on Settings save to catch the case where `real_name` is set AFTER matching entities already exist in the DB. Both check exact canonical-form match against `real_name` + each `identity_alias` line. The CLI tool remains useful for heavy cluster cleanup and edge cases (manual link of a name variant that doesn't pass the exact-match gate) but is no longer required for first-run UX. To keep the per-entity cost flat, the `find_user_self_id` lookup is lifted to once-per-extraction via a cached `user_self_already_exists` flag — the inline auto-promote check only acquires the DB lock once per extraction in steady state, not once per fresh entity.
 
-4. **Stage 2 gained reverse-direction substring rescue.** Original §6 described forward substring rescue only (inbound name as substring of an existing canonical). Shipped adds `stage2_reverse_substring_candidates()` using SQL `instr(?, canonical_name) > 0` to find shorter existing canonicals whose names appear inside a long-form inbound. Closes the symmetric gap where the per-token LIKE never finds "Kris" when searching "kristopher kersey" — the existing forward path catches the inbound short form, but a fresh long-form needs the reverse direction to find the existing short form. Bounded with `length(canonical_name) <= length(inbound)` SQL pre-filter to skip rows that can't possibly be a substring, and skipped entirely when the inbound is < 8 characters (the reverse direction can't usefully match anything when the inbound itself is a short form).
+4. **Stage 2 gained reverse-direction substring rescue.** Original §6 described forward substring rescue only (inbound name as substring of an existing canonical). Shipped adds `stage2_reverse_substring_candidates()` using SQL `instr(?, canonical_name) > 0` to find shorter existing canonicals whose names appear inside a long-form inbound. Closes the symmetric gap where the per-token LIKE never finds "Jon" when searching "jonathan smith" — the existing forward path catches the inbound short form, but a fresh long-form needs the reverse direction to find the existing short form. Bounded with `length(canonical_name) <= length(inbound)` SQL pre-filter to skip rows that can't possibly be a substring, and skipped entirely when the inbound is < 8 characters (the reverse direction can't usefully match anything when the inbound itself is a short form).
 
 5. **CONFIG_CLAMP NaN hardening (codebase-wide side-effect).** Runtime thresholds are exposed via the `[memory.entity_merge]` config keys `enabled` / `auto_threshold` (0.90 default) / `review_threshold` (0.50 default, down from the compile-time 0.70 used during Phase 1 — the shipped propose-all-in-band path makes review-band recall more valuable than precision since the operator is gating). The `CONFIG_CLAMP` macro was rewritten codebase-wide to catch NaN / +inf / -inf — IEEE 754 NaN compares false to everything, so the old `(val < lo || val > hi)` form silently let NaN through every validator. The new negated-range form `!((val) >= (lo) && (val) <= (hi))` rejects NaN as out-of-range. Side-effect security improvement reaches every config validator in the project, not just entity_merge.
 
-**Deferred follow-up: prefer longer canonical name for person/pet/place.** Today's cascade picks the existing canonical as the merge target regardless of which name form is "fuller" — direction is determined incidentally by extraction order (whoever was inserted first wins canonical, whoever arrives second becomes alias). For person/pet/place entity types the intuition is "longer wins" (Kristopher Kersey canonical, Kris alias). Doesn't apply uniformly to `org` (acronyms like IBM are often the canonical form in common usage) or `thing`. Fix shape: in `memory_db_entity_consider_auto_merge`, after the cascade picks `winner_id` (target) and we know `entity_id` (source), if both are person/pet/place AND source has strictly more whole-word tokens than target AND target has no dependents (no aliases pointing at it, no exclusive open relations as subject), swap source↔target before `alias_link`. The "no dependents" guard avoids orphaning a subtree when the existing canonical is the head of an equivalence class — Phase 3 hard consolidate handles relation migration when that's wanted. The user-self entity already gets "longer wins" via the `users.real_name` + auto-promote anchor, so this fix mainly affects spouse / kids / friends / family clusters where no real_name anchor exists.
+**Deferred follow-up: prefer longer canonical name for person/pet/place.** Today's cascade picks the existing canonical as the merge target regardless of which name form is "fuller" — direction is determined incidentally by extraction order (whoever was inserted first wins canonical, whoever arrives second becomes alias). For person/pet/place entity types the intuition is "longer wins" (Jonathan Smith canonical, Jon alias). Doesn't apply uniformly to `org` (acronyms like IBM are often the canonical form in common usage) or `thing`. Fix shape: in `memory_db_entity_consider_auto_merge`, after the cascade picks `winner_id` (target) and we know `entity_id` (source), if both are person/pet/place AND source has strictly more whole-word tokens than target AND target has no dependents (no aliases pointing at it, no exclusive open relations as subject), swap source↔target before `alias_link`. The "no dependents" guard avoids orphaning a subtree when the existing canonical is the head of an equivalence class — Phase 3 hard consolidate handles relation migration when that's wanted. The user-self entity already gets "longer wins" via the `users.real_name` + auto-promote anchor, so this fix mainly affects spouse / kids / friends / family clusters where no real_name anchor exists.
 
 ### Phase 3 — Hard-merge consolidation + bulk backfill
 
