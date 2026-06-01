@@ -270,7 +270,7 @@ Items considered, explicitly deferred:
 
 - **Bench-wiring focus injection through `bench_memory_pipeline.c`.** The existing LoCoMo bench (`bench_memory_pipeline.c` + `run_benchmark.py`) measures `memory_action_search` retrieval, not focus injection. Building a focus-aware LoCoMo harness would let us measure how focus injection affects answer quality across the full LoCoMo dataset. ~1-2 days of new bench infrastructure for marginal value over Component 6 — deferred.
 
-- **Phase 2 — DAWN background context.** Sketched in the rev-3 design doc. Silent-observe events fed into a sibling memory store (separate from the user's facts/entities), per-day conversation_id, nightly compaction. Forward-pointer only; full design pass deferred.
+- **Phase 2 — DAWN background context.** Silent-observe events fed into a sibling memory store (separate from the user's facts/entities), per-day conversation_id, nightly compaction. Sketch preserved below ([Phase 2 — DAWN background context (sketch)](#phase-2--dawn-background-context-sketch)); full design pass deferred.
 
 ---
 
@@ -288,9 +288,74 @@ Real-DB validation surfaced three classes of imperfection that are NOT focus-inj
 
 ---
 
+## Phase 2 — DAWN background context (sketch)
+
+Preliminary design preserved from the rev-3 working draft (folded in here at that
+draft's retirement). The full design pass is **deferred to its own session**; the
+decisions below are resolved starting points, not a final spec.
+
+**Architecture:** a dedicated per-day `conversation_id` for DAWN's own observations
+(or a sibling table — choice deferred, but lean toward a sibling table per
+architecture review L3, to avoid widening the conversations table).
+
+**Logged events** (filter-gated for user-influenceable inputs per security review H2):
+
+| Event | User-influenceable? | Filter check required |
+|---|---|---|
+| Notification fired | yes (SMS, email body) | yes |
+| Calendar event passed | yes (CalDAV title/description) | yes |
+| Scheduled task executed | yes (user-set title/notes) | yes |
+| New conversation started | indirect | yes |
+| Conversation compacted | indirect (LLM summary) | yes |
+| MQTT events of significance | broker-trusted; treat as user-controlled | yes |
+| Music track played / playlist changed | partially (tag metadata) | yes |
+| Errors observed | system-generated | no |
+| Satellite registered / went offline | partially (registration name) | yes |
+| HUD discovery | partially (component name) | yes |
+
+Every user-influenceable event passes through `memory_filter_check()` before the
+silent-observe call. Filter-match events are still logged (with rejection metadata)
+— the offending text is replaced by a placeholder so the event is *recorded* for
+DAWN's awareness without polluting context.
+
+**Compaction:** nightly at 3am local time, **idle-gated**. "Idle" across all surfaces:
+
+- WebUI sessions: no user message in the last 30 minutes
+- Tier 1 satellites: not currently recording / playing audio
+- Tier 2 satellites: not in an active push-to-talk session
+- MQTT: no user-attributed activity (commands from a satellite or local mic)
+- Voice always-on: no wake-word-followed-by-speech in the last 30 minutes
+
+If any surface is active at 3am, compaction defers to the next 30-minute idle window
+(re-check on a 5-minute timer, hard upper bound 4am local — past that, defer the
+whole compaction to next night). Configurable via `[memory.dawn_background]
+compaction_idle_minutes = 30`.
+
+The LCM substrate handles the context-rolling: yesterday's full background-context
+conversation is summarized, and the summary seeds the new day's conversation
+("Yesterday: [compacted bullet list]"). The old day's full context is retained in the
+`summary_nodes` DAG for drill-down via `context_expand`.
+
+**Surfacing into active chats (Layer 3 / anticipatory):** background context becomes
+one source for the Phase 1 framework. Adapter shape:
+
+- `requires_embedding = false`; query input is current time + recent-turn embedding
+- emits candidates for time-relevant items (calendar event approaching, scheduled task firing)
+- multi-chat dedup via a `surfaced_items_set`
+- anticipatory firing also triggers `PROMPT_REFRESH_SESSION_START` (Layer 1 invalidation, per architecture review H3)
+
+**UI surface — DAWN Background Context Viewer** (per UI review M1): a two-pane layout
+matching the existing memory panel — left pane a vertical timeline (today expanded;
+older collapsed by date with a `summary_nodes` preview, plus a filter chip bar and
+search), right pane the detail view of the selected observation (provenance link,
+"open source conversation", reusing `memory-source-modal` styling). Filed as its own
+top-level rail icon (sibling to memory) — a viewing-not-configuring surface.
+
+---
+
 ## Sources
 
-- Rev 3 design doc (`dawn/docs/DYNAMIC_CONTEXT_INJECTION_DESIGN.md`) — working / scratch document, untracked per project policy. Captures the in-flight architectural decisions across phases. Superseded by this atlas record at Phase 1 close; developer's local copy may be retained or removed at their discretion.
+- Rev 3 design doc (`dawn/docs/DYNAMIC_CONTEXT_INJECTION_DESIGN.md`) — working / scratch document, untracked per project policy. Its Phase-1 reality is captured in this atlas record and its Phase-2 sketch is folded in above; the draft is retired (removed at Phase 1 close).
 - Per-phase architecture-reviewer pre-dispatch reviews — caught Criticals on every phase prompt before worker dispatch (verified value across 1c, 1d, 1e, 1f, 1g-i, 1g-ii, 1h, 1i, 1j.A, 1j.B, reextract-utility). The pattern is now standard practice for any non-trivial worker dispatch in this codebase.
 - Four-agent end-of-phase reviews (architecture / embedded / security / coding-standards, plus ui-design-architect for UI-touching phases). Findings + remediation captured in commit messages.
 - Phase 1g-ii fix-pass commit — the most-comprehensive single fix-pass in the workstream (1 Critical + 7 Highs + 6 Mediums folded). Reference for the discipline of "code-review before paid validation" + "fix-pass before commit" rhythm.
