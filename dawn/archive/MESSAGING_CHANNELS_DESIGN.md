@@ -1603,6 +1603,70 @@ drop the inline fallback.
   `dawn-admin`.  An admin "all channels" WebUI view is deferred unless
   operators ask.
 
+### Phase 6.5 — Per-conversation LLM + secrets/driver lifecycle fixes — **SHIPPED 2026-06-02**
+
+Closes the **tool-call bluff** surfaced in Phase 6 live testing (item (c)): a
+messaging session on the small global model with thinking disabled replied
+"Briefing scheduled" with no `scheduler.create` tool call (`end_turn`, no
+`tool_use`, no DB row). Live-verified fixed — a Telegram turn now emits
+`finish_reason: tool_calls` → `scheduler.create` executes (briefing actually set).
+
+**Design decision — per-conversation, not global.** The first attempt was an
+engine-wide `[messaging.llm]` config block; it was scrapped before ship as the
+wrong layer. The WebUI already models LLM choice **per conversation**
+(`conversations.llm_*` columns, v11), and every messaging channel already owns a
+forever-conversation. So messaging reuses that exact mechanism — owned by the
+user, per channel — rather than inventing a global knob.
+
+- **Server-side apply (the missing piece).** `get_or_create_messaging_session`
+  reads the forever-conversation's stored `llm_*` via `conv_db_get` and applies
+  them with `session_set_llm_config` at session creation. The WebUI applies
+  per-conversation settings via a browser round-trip; messaging has no client to
+  round-trip through, so the columns were silently ignored until now. Gateway-
+  aware: when the OpenRouter gateway is on, the provider enum is forced to
+  `CLOUD_PROVIDER_OPENROUTER` so the key check validates the right key (mirrors
+  `build_compaction_config` / `resolve_silent_observe_config`); a `local`
+  conversation keeps its local model.
+- **Thinking-on seed.** New messaging conversations are seeded `thinking=enabled`
+  / `effort=low` at creation (`resolve_channel_conversation_id` →
+  `conv_db_lock_llm_settings`, NULL provider/model = inherit). That's the bluff
+  fix; user-overridable per channel.
+- **`switch_llm` persists.** The existing tool now writes the change back to the
+  conversation row (`conv_db_update_llm_settings`) so an in-chat "switch to
+  Claude" survives session recreation. Only messaging sessions persist (they
+  carry `messaging_identity.conversation_id`, added for this); WebUI/local keep
+  live-only behavior. Best-effort with a WARN on persist failure.
+- **WebUI per-channel controls.** The Messaging Channels panel gained Reasoning
+  / Effort selects (model read-only — changed via the tool); a new
+  `set_channel_llm` WS opcode (auth + ownership via `conv_db_get`, messaging-
+  origin check, length + enum validation) writes the conversation row.
+  `list_channels` LEFT JOINs `conversations` for the current settings +
+  `provider_available` (`find_driver != NULL`). "Default" options resolve to the
+  global value (e.g. "Default (Off)", "Default (claude-sonnet-4.6)").
+- **`cloud_provider_from_string`** added next to `cloud_provider_to_string`
+  (single string→{type,provider} authority, replacing inline ladders).
+
+**Folded-in fixes found along the way (separate concern, same session):**
+
+- **Secrets round-trip data loss (CRITICAL).** `secrets_write_toml` rewrote
+  `secrets.toml` with `O_TRUNC` but had no lines for `telegram_bot_token`,
+  `discord_bot_token`, `slack_app_token`, `slack_bot_token`, **or
+  `service_token`** — so any WebUI "Save Secrets" silently wiped all five. Added
+  them to the writer (escaped), to `handle_set_secrets` (the four messaging
+  tokens), and to `secrets_to_json_status`. WebUI Secrets section now has fields
+  for the three bot tokens. (`service_token` is preserved on write but stays
+  out-of-band — it's a service-auth secret, not WebUI-managed.)
+- **Live driver start.** Drivers only registered at startup, so adding a token
+  required a restart. `messaging_tool_refresh_drivers()` (called from
+  `set_secrets` next to `llm_refresh_providers`) starts any token-gated driver
+  whose token is now present but not yet registered. Additive only — rotating /
+  removing a token is still restart-to-apply (live teardown would join a
+  long-poll listener; the engine has no clean per-driver unregister path).
+- **Honest channel status.** A linked channel whose driver isn't loaded shows
+  "Not connected" (amber) instead of "Active", with a hint to add the token.
+
+User-facing setup for all of the above: `dawn/docs/MESSAGING_CHANNELS_SETUP.md`.
+
 ### Phase 7 — Post-v1 cleanup (optional)
 
 - Consolidate the six scheduler weak symbols into a
