@@ -1,10 +1,13 @@
 # Memory Ephemerality / Fact-Lifecycle Axis (C3) — Design + Ship Record
 
-**Status:** **Phase 1 SHIPPED + LIVE-VALIDATED 2026-06-05.** Commits `b30a16c` (schema v58 +
-retrieval guard + prune + extraction tagging + config + WebUI panel) and `3912310` (memory-tool
-anti-bluff + object-form). `expire_enabled` defaults **off**; the one remaining gate before
-default-on is the B1-style recall-neutrality bench (§7). Architecture-reviewed 2026-06-04;
-implemented + validated on the real DB across two live test sessions 2026-06-05. Atlas ship record
+**Status:** **Phase 1 SHIPPED + LIVE-VALIDATED 2026-06-05; recall-neutrality bench run 2026-06-06 —
+NOT recall-neutral, `expire_enabled` stays OFF by default (data-backed).** Commits `b30a16c`
+(schema v58 + retrieval guard + prune + extraction tagging + config + WebUI panel) and `3912310`
+(memory-tool anti-bluff + object-form). The bench (§ Recall-neutrality bench + product verdict,
+below) measured **−4.33pp `recall_generation` / −3.03pp `recall_reach`** on a 2-conv LoCoMo smoke
+when expiry is on — so **do not flip default-on as tuned**. The feature works; the cost is
+**over-tagging** (it expires dated *events that become memories*, not just ephemera). Off-by-default
++ opt-in is the correct, now-data-backed posture. Architecture-reviewed 2026-06-04. Atlas ship record
 (moved here from `dawn/docs/` on completion). Drafted from the C1 diagnosis; §1–§9 are the original
 design rationale, the Implementation note below is the as-shipped record (supersedes §4/§5 where they
 differ).
@@ -73,9 +76,77 @@ expiring one. Left to the AI's existing `find_duplicates` / `forget --replaced_b
 Friday does spontaneously). An automated expiry-propagation pass was considered and **rejected** — it
 reintroduces exactly the misflag surface C3 deliberately avoids.
 
-**Next:** the B1-style recall-neutrality bench (Mem0 protocol, `expire_enabled` on) before flipping
-default-on; then the deferred legacy back-fill (§6). Phase 2 (durability class) only if a fuzzy tail
-remains.
+**Next:** the recall-neutrality bench RAN 2026-06-06 (verdict below) — default-on is off the table as
+tuned. No further work planned; the feature stands as a proven, dormant, opt-in capability. If
+default-on is ever wanted, the lever is sharper extraction targeting (verdict §), not more machinery.
+
+---
+
+## Recall-neutrality bench + product verdict (2026-06-06)
+
+**Method.** B1-shaped paired A/B on a 2-conv LoCoMo smoke (n=231 QAs, full Mem0 protocol —
+`gpt-4o-mini` gen+judge, `--prompt-style mem0 --with-source --exclude-categories 5`, leader-comparable
+YES). One extraction with `expire_enabled=on` populated `expires_at`; both arms then ran on the
+**identical snapshot** (cache key is template-hashed, so it's shared), toggling only the runtime
+retrieval guard. So the delta isolates the *expiry hiding effect* cleanly. ~$2.2 spend.
+
+**Result — NOT recall-neutral:**
+
+| Arm | `recall_generation` | `recall_reach` (deterministic) |
+|---|---|---|
+| Expiry **OFF** (all 366 facts) | **0.7532** | 0.9483 |
+| Expiry **ON** (7 facts hidden) | **0.7100** | 0.9180 |
+| **Δ (ON − OFF)** | **−4.33 pp** | **−3.03 pp** |
+
+`recall_reach` (top-K provenance overlap, *not* an LLM-judge metric) dropped 3pp too, so this is a
+**real retrieval effect, not judge noise.** Per-category the hit lands where expected: cat-2 (temporal)
+gen −6.4pp, cat-4 −4.4pp, cat-1 −2.3pp, cat-3 flat.
+
+**Diagnostic — expiry barely fires, but on the wrong things.** Only **7 of 366 facts (1.9%)** got
+tagged. Inspecting them: *every one is a dated event* — a conference, a museum trip with the kids, a
+dance competition, a studio opening on 2023-06-20. These are the C3 target shape ("opening tomorrow",
+"competition next month") **but they become durable autobiographical memories the moment they happen**,
+and LoCoMo's temporal/event questions ("when did X happen?") ask about them. Hiding them after expiry
+loses the answer. The extraction is **over-tagging**: the prompt's "leaves no lasting record" qualifier
+isn't conservative enough for the Haiku extractor.
+
+**Product / architecture verdict (the honest read, not metric-massaging):**
+
+1. **DAWN ≠ archival QA.** LoCoMo grades perfect recall of a frozen 2023 transcript at an arbitrary
+   2026 "now" — so it (a) *maximizes* expiry's cost (every dated fact is 3 years stale; the guard nukes
+   them all at once and then quizzes you), and (b) is *structurally blind* to expiry's benefit (a lean,
+   present-focused corpus — it can only count what you forgot, never that you stopped being a junk
+   drawer). A live assistant queries events *when they're temporally relevant*, not 3 years later, so
+   the live harm is smaller than −4.3pp.
+2. **But the −4.3pp is a real signal, not an artifact to wave away.** The 7 facts weren't ephemera —
+   they were *memories*. Expiring "we opened the studio on 2023-06-20" is wrong everywhere, just
+   quietly in production vs loudly on a scoreboard. The bench correctly caught that the line between
+   "junk" and "memory" is currently in the wrong place.
+3. **Hard-expire-then-delete is the wrong primitive for autobiographical memory.** A human — and a
+   JARVIS — doesn't *delete* that you opened a studio; the *upcoming-ness* fades while the *event*
+   stays. The design already has the right tools and just isn't drawing the line cleanly: pure
+   ephemera/snapshots (forecasts, "gutter guy Thursday", current-state) → `expires_at` + prune; events
+   that become memories → the *relation's* `valid_to` closes ("attending X" is no longer pending) but
+   the **fact persists**, or softer still, transient facts **decay in retrieval rank** (fade from the
+   front of mind, recallable if asked directly). That's the recall-safe, human model.
+
+**Decision.** `expire_enabled` stays **OFF by default** — now data-backed, not a punt. C3 is a
+deliberate *tidiness-vs-recall trade-off*, fine as the opt-in it already is (on a personal DB you
+*want* "movie tonight" to auto-clear, accepting you won't recall it precisely later) but not a free
+win, so not the default. A defensible default-on would require **sharper extraction targeting** (expire
+only zero-recall-value snapshots, route events to `valid_to`-fades-fact-stays or soft rank-decay) —
+filed as a follow-up, not scheduled.
+
+**What's retained regardless (all orthogonal to expiry — the arc's real prize):** with `expire_enabled`
+off, the deletion machinery is fully inert (extraction never tags — the teaching block is empty;
+guard binds `now=0`; `prune_expired` never runs; merge-adoption never fires), so **no path forgets a
+memory.** Meanwhile the always-on wins from this arc are live: the **anti-bluff** clause (Friday calls
+`remember` reliably instead of acknowledging-without-storing), the revived **`with_source` / `as_of` /
+`include_historical`** (dead before the `LLM_TOOLS_MAX_PARAMS` 8→16 cap fix `d924e7a`), and **`forget
+--replaced_by`** recoverable merge (C4). One wart: the `remember` tool *description* still advertises
+the `{text, expires_at}` object form (compile-time, not runtime-gated), so with expiry off the LLM can
+emit an expiry that's silently dropped — harmless but slightly misleading; trim it from the description
+if staying off long-term.
 
 ---
 
