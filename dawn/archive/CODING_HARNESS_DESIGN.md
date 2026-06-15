@@ -8,10 +8,12 @@ design + as-built record for the whole program. It graduated here from three wor
 `dawn/docs/` (the Phase 1 plan, the Phase 2 plan, and the cbm-sharing note) once the program
 settled.
 
-**Feature flag:** the whole subsystem is compiled out by default. It requires
-`-DDAWN_ENABLE_CODE_PROJECTS=ON` (which in turn requires `-DDAWN_ENABLE_MCP_BRIDGE_TOOL=ON`
-and libgit2 ≥ 1.6). **No build preset enables it** — it's an explicit opt-in. Merging it is a
-no-op for stock builds.
+**Feature flag:** the CMake *option* `DAWN_ENABLE_CODE_PROJECTS` defaults OFF (it pulls in
+`DAWN_ENABLE_MCP_BRIDGE_TOOL` and libgit2 ≥ 1.6). As of **Phase 9**, the `default`/`full`/`debug`
+presets enable both flags, so those builds compile the subsystem in and require libgit2 (the
+installer builds it by default); the `local`/`server`/`ci` presets omit it. The runtime is still
+gated by `[code_projects] enabled` in `dawn.toml`, so a preset build with no cbm server configured
+is inert.
 
 **User/operator guide (lives in-repo, not here):**
 [`dawn/docs/CODING_PROJECTS.md`](https://github.com/The-OASIS-Project/dawn/blob/main/docs/CODING_PROJECTS.md)
@@ -34,6 +36,12 @@ no-op for stock builds.
 - `76ffb64` — surface `CODING_PROJECTS.md` in README/GETTING_STARTED.
 - `f9a2da6` — address Qodo + Copilot PR #20 review (SSRF same-origin guard, CI-grep
   hardening, Doxygen, `valid_url` fail-closed, `0`→`SUCCESS`).
+
+*Phase 9 — install/UX polish:*
+- `7bd5d6a` — flags added to the `default`/`full`/`debug` CMake presets (libgit2 install flipped
+  default-on); cbm-mcp installer interactive `--local-roots` → systemd drop-in + traverse ACLs;
+  `allowed_local_roots` surfaced in WebUI Settings (round-trip); `.dawn-tabs`/`.dawn-tab` CSS
+  primitive extracted + 3 consumers migrated. `styledPrompt` deferred to the Odysseus Tier-0 batch.
 
 ---
 
@@ -1281,10 +1289,12 @@ the link-local section above (`ProtectHome=tmpfs` + `BindReadOnlyPaths`, kept in
 
 ## Deferred / future (not shipped)
 
-- **Phase 9 install polish:** surface `allowed_local_roots` in WebUI Settings (array
-  save/restore), automate the cbm-mcp sandbox grant in `scripts/install.sh`, wire the feature into
-  the `full` preset (no manual `-D`). Plus a `.dawn-tab` shared CSS primitive and `styledPrompt`
-  for set-branch.
+- **`styledPrompt`** (themed replacement for native `prompt`/`confirm`): set-branch still uses
+  `window.prompt`. Deferred to the Odysseus Tier-0 batch where the shared primitive is built once
+  for all native-dialog sites.
+- **Top-level installer integration:** the cbm-mcp sandbox grant is automated in
+  `services/cbm-mcp/install.sh --local-roots`, but wiring it fully into the top-level DAWN
+  installer (one end-to-end step) is still possible polish.
 - **No-cbm local provider** (the Phase 1 "No-cbm minimal path" sketch): a second
   `code_graph_provider` impl that greps/reads the cloned tree in-process so the feature is useful
   without cbm. Removes the "clone-then-error" dead end.
