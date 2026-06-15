@@ -103,3 +103,9 @@ Memory has its own subdirectory at [`dawn/memory/`](dawn/memory/) — see the [m
 | [EMAIL_DESIGN](dawn/archive/EMAIL_DESIGN.md) | Email integration (IMAP/SMTP, Gmail REST API, multi-account, 10 LLM actions) |
 | [TWO_STEP_TOOL_PATTERN](dawn/archive/TWO_STEP_TOOL_PATTERN.md) | Two-step tool pattern: load guidelines then execute (used by render_visual) |
 | [VISUAL_RENDERING_TOOL](dawn/archive/VISUAL_RENDERING_TOOL.md) | Visual rendering tool: inline SVG/HTML diagrams via LLM tool calling, progress indicator investigation |
+
+### Coding Harness (Code Projects + MCP Bridge)
+
+| Document | Description |
+|----------|-------------|
+| [CODING_HARNESS_DESIGN](dawn/archive/CODING_HARNESS_DESIGN.md) | Code-projects subsystem: HTTP+SSE **MCP bridge** to an operator-launched cbm (`codebase-memory-mcp`) code-graph server, in-process **libgit2** clone/fetch/checkout, per-project name-translation boundary, WebUI Coding popover + dawn-admin CLI. Phase 1 (clone-and-index) + Phase 2 (branch tracking, link-local repos, refresh-vs-rebuild, multi-project namemap, cbm sharing with Claude Code). Default-OFF (`DAWN_ENABLE_CODE_PROJECTS`); no-subprocess invariant CI-enforced. Consolidates the Phase 1 plan, Phase 2 plan, and cbm-sharing note. |
