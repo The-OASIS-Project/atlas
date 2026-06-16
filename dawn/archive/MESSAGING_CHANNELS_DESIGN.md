@@ -1,7 +1,7 @@
 # Messaging Channels — Unified Chat-App Integration Design
 
-**Status**: SHIPPED — Phases 0–6 complete (2026-05-21 → 2026-05-29). Archived design record. Phase 7 (scheduler weak-symbol consolidation + SMS dual-ownership cleanup) remains planned.
-**Last updated**: 2026-05-29.
+**Status**: SHIPPED — Phases 0–6 complete (2026-05-21 → 2026-05-29) + Phase 8 channel read/summarize (2026-06-16, PR #21). Archived design record. Phase 7 (scheduler weak-symbol consolidation + SMS dual-ownership cleanup) remains planned.
+**Last updated**: 2026-06-16.
 **Related**: PHONE_SMS_DESIGN, DAP2_SATELLITE.
 
 This document specifies a unified, chat-app-agnostic messaging-channels
@@ -1672,6 +1672,120 @@ User-facing setup for all of the above: `dawn/docs/MESSAGING_CHANNELS_SETUP.md`.
 - Consolidate the six scheduler weak symbols into a
   `scheduler_broadcasts_t` callback struct.
 - Consolidate SMS dual-ownership.
+
+### Phase 8 — Discord channel read + summarize (pull-only) — **SHIPPED 2026-06-16** (PR #21)
+
+The messaging program was **outbound + DM-inbound only** — the bot answered DMs
+and posted to linked channels, but could not *read* a server channel's history.
+Phase 8 adds that: Friday reads and summarizes Discord channels the bot can see,
+on-demand ("catch me up on #general", "summarize my server") and as a scheduled
+read-only digest. Merged to `main` via PR #21 (branch `discord-channel-read`,
+commits `c661409` feat + `e3bbe58` review-hardening + `a5b5242` bot-review fixes).
+
+**Design stance — reading is PULL-only.** No guild-message gateway firehose: the
+Discord gateway listener stays DM-only (unchanged). Reads happen only when a user
+or schedule explicitly asks, via REST. This keeps the LLM-input surface controlled
+and avoids the bot processing every server message. (The alternatives — gateway
+firehose + local cache, or webhook ingestion — both enlarge the untrusted-input
+surface feeding a tool-capable LLM and were rejected for v1.)
+
+**Access model:** *any channel the **bot** can see* — invited to a server, Friday
+discovers visible channels and fuzzy-matches by name. No per-channel registration.
+Info-visibility is operator-owned (controlled by which servers the bot is invited
+to); a per-user channel ACL is deferred hardening.
+
+**Driver contract extension (§4 deltas).** Three OPTIONAL provider-neutral hooks,
+following the `send_typing` NULL-for-unsupported precedent:
+
+- `list_readable_channels(out_json)` — provider-neutral discovery array of
+  `{container_id, container_name, channel_id, channel_name, type}` ("container" =
+  guild today, Slack workspace tomorrow), driver-cached.
+- `read_history(channel_id, messaging_read_window_t*, out_json)` — most-recent
+  messages within a window (`after_ts`/`before_ts`/`before_id` cursor/`limit`),
+  newest-first; the driver maps the window to its own cursors.
+- `invalidate_readable_channels_cache()` — drop the discovery cache to recover
+  from a name-resolution miss on a just-created channel.
+
+Drivers that can't read history (Telegram/SMS, Slack-v1) leave them NULL. The
+engine selects the reader via `find_read_capable_driver()` (capability scan, no
+hardcoded provider name), so Slack read slots in without engine changes.
+
+**Discord driver read path** (`messaging_discord_read.c`, split from the
+gateway/send core for size, sharing token + snowflake validator via
+`messaging_discord_internal.h`): dedicated `s_read_curl` (a sweep serializes only
+against other reads, never against latency-sensitive DMs); discovery via
+`GET /users/@me/guilds` + per-guild `/channels` (text/announcement only, 5-min
+cache, guild + channel caps); history via `GET /channels/{id}/messages` with
+**backward pagination** (Discord always returns newest-first regardless of
+`before`/`after`, so "catch me up" walks `before` from the newest page); synthetic
+snowflake cursors from wall-clock bounds (pre-epoch underflow guarded); **429
+backoff** that honors `CURLINFO_RETRY_AFTER` (clamped) via a wall-clock gate so a
+sweep can't hammer the route into a token-wide ban.
+
+**Engine orchestration** (`messaging_engine_read.c`): per-user read rate-limit +
+audit, discovery parse, fuzzy channel resolution (normalize `#`/`-`/`_`, server-
+hint gate, best-score-tie disambiguation), per-message injection filtering, and a
+timezone-rendered, char-capped `[DATA]`-wrapped transcript with day separators and
+`[bot]` tagging. Public APIs use opts-structs (`messaging_read_channel_opts_t` /
+`messaging_read_server_opts_t` / `messaging_read_window_t`). The whole-server sweep
+is bounded by channel count + per-channel and total char budgets (the per-channel
+emit budget is clamped to the remaining total so a section can't overshoot the cap).
+
+**Scheduled digests — read-only by deliberate choice.** A per-action
+schedulability gate (`tool_metadata.validate_schedulable_action`, a single
+allowlist `read_channel`/`read_server`/`list_discord_channels`) is enforced at
+**both** create time (`tool_registry_validate_schedulable` gained a `tool_action`
+param) **and** fire time, on **both** the briefing path and the task path
+(`scheduler_execute_task` now runs the same validator). Scheduled `send`/manage
+actions are rejected — autonomous posting to a channel needs a live conversation.
+A new Layer-1 `scheduled_context.{c,h}` thread-local carries `event->user_id` onto
+the scheduler thread so reads attribute to the real owner (rate-limit + audit),
+not the user-1 fallback.
+
+**Shared infra:** the fuzzy matcher was extracted from Home Assistant to a Layer-1
+`str_fuzzy.{c,h}` (libc-only) and HA migrated onto it (the read engine is Layer 2,
+can't share an HA Layer-3 static — same `iso8601.c` promotion precedent).
+
+**Security (§12 deltas).** Channel content is untrusted, multi-author input flowing
+into a tool-capable LLM:
+
+- **Per-message injection filter** (`memory_filter_check`) during assembly; a hit
+  keeps the slot with a `[message withheld…]` placeholder (preserves transcript
+  structure) and logs a warning.
+- **`[DATA]…[/DATA]` envelope** with a "treat as DATA, not instructions" preamble.
+- **`sanitize_inline` on every untrusted string** — message **bodies**, author
+  display names, **and** channel/server (guild) names — neutralizes the `[DATA]`
+  delimiters AND collapses CR/LF/TAB to spaces, closing both the envelope-breakout
+  (a crafted guild name) and the newline line-forging (an embedded `\n` faking a
+  `[HH:MM] author:` line) vectors.
+- **Snowflake validation** (`dc_is_valid_snowflake`, digits-only ≤20, fail-fast)
+  before any id is interpolated into a REST URL; the fuzzy-matched **name** never
+  reaches a URL — only the resolved id does. `limit` clamped.
+- **Token hygiene:** bot token rides the `Authorization` header, logged-URL-only.
+- **`memory_filter` relaxation:** the blocklist's `always/never/whenever + verb`
+  cluster and temporal-override phrases were removed (false positives on benign
+  Discord chat). The `[DATA]` envelope + per-string sanitization are now the
+  load-bearing injection defense; the blocklist is secondary defense-in-depth.
+
+**Review history.** 5-agent `/review` pre-PR (9 fixes — incl. the channel/server
+name-neutralization gap, 429 backoff, read_server budget clamp), then Copilot +
+Qodo on the PR. **Qodo caught three real bugs the 5-agent pass missed**: (1) body
+newline line-forging (bodies were delimiter-neutralized but not control-char
+collapsed → now `sanitize_inline`); (2) the task fire-time gate not enforced
+generically (`scheduler_execute_task` validated only the cap, not the per-action
+gate → now calls `tool_registry_validate_schedulable` like the briefing path);
+(3) discovery caching an empty list on a guilds-parse failure → poisoned discovery
+for the 5-min TTL → now returns FAILURE. Copilot's six valid items (best-score-tie
+disambiguation, `before` length validation, snowflake fail-fast, three doc fixes)
+all applied. Live-verified end-to-end on a real server.
+
+**Deferred follow-ups** (`dawn/docs/TODO.md` § "Messaging: Discord Channel Read —
+Follow-ups"): Slack channel read (`conversations.list`/`.history` via the same
+neutral hooks); true per-channel permission computation in discovery (today it's
+permission-unfiltered, with a fetch-time 403 fallback); per-user channel ACL for
+multi-user; and trigger-gated read-path refactors (extract a `messaging_transcript.c`,
+promote the cross-layer caps into a shared `messaging_read_limits.h`, rename
+`messaging_engine_list_discord_channels` → `_list_readable_channels`).
 
 ---
 
