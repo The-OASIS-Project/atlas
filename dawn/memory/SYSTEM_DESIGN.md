@@ -1,9 +1,9 @@
 # DAWN Memory System Design
 
-**Status:** Phases 1-6.7, S4-S8 Complete - Core Memory, Decay, WebUI Viewer, Import/Export, Contacts WebUI, Entity Merge, Entity Graph, Embeddings, Injection Filter, Categorization, Temporal Scoring, Contradiction Detection
+**Status:** Phases 1-6.7, S4-S8 Complete - Core Memory, Decay, WebUI Viewer, Import/Export, Contacts WebUI, Entity Merge, Entity Graph, Embeddings, Injection Filter, Categorization, Temporal Scoring, Contradiction Detection, BM25 keyword channel, Fact ephemerality (expires_at), Notes/reference store + memory↔note bridge
 **Date:** January 2026
 **Authors:** Kris Kersey, with input from community proposals
-**Last Updated:** 2026-04-26
+**Last Updated:** 2026-06-16
 
 ---
 
@@ -27,7 +27,7 @@ A comprehensive design for DAWN's persistent memory system with integrated RAG (
 - **S7 (Temporal Scoring):** ✅ Complete - Time-expression parser, Gaussian decay scoring, temporal relation bounds (valid_from/valid_to)
 - **S8 (Contradiction Detection):** ✅ Complete - Relation-driven fact supersede, expanded exclusive relations (12), contradictory pairs (4), extraction prompt with 20 relation types
 - **Phases 7-11 (RAG):** ✅ Implemented — see `docs/RAG_DESIGN.md` (separate system)
-- **Retrieval Benchmarks:** ✅ Complete - LongMemEval turn-level 97.0% R@5 (27.2pp above published SOTA), ConvoMem 99.0%, LoCoMo 81.6% (bge-small int8 + proper-noun boost) — see `benchmarks/README.md`
+- **Retrieval Benchmarks:** ✅ Complete — headline numbers and history live in [`STATE.md`](STATE.md) (single source of truth; refresh there when numbers move). NB: only `recall_generation` under the Mem0 protocol is leader-comparable; `recall_reach` (DAWN-internal top-K provenance overlap) is **not** comparable to published ByteRover/MemMachine/Mem0 figures. See `benchmarks/README.md` + `dawn/CLAUDE.md` §Benchmark Methodology.
 
 ---
 
@@ -569,7 +569,7 @@ For 1,000 document chunks: ~1.5 MB of vector data (trivial)
 
 ## 6. Storage Schema
 
-Using SQLite (already a DAWN dependency for auth). Current schema version: **v48**. The schemas below regenerate from `src/auth/auth_db_core.c` (`SCHEMA_SQL` + the v33-onward migration blocks); the version constant lives in `include/auth/auth_db_internal.h:51` (`AUTH_DB_SCHEMA_VERSION`).
+Using SQLite (already a DAWN dependency for auth). Current schema version: **v66** (as of 2026-06-16). The schemas below regenerate from `src/auth/auth_db_schema.c` (`SCHEMA_SQL`) plus the per-version migration blocks in `src/auth/auth_db_migrations.c` (and `auth_db_migrations_v64.c` / `_v65.c` / `_v66.c`); the version constant lives in `include/auth/auth_db_internal.h:59` (`AUTH_DB_SCHEMA_VERSION`). Memory-relevant changes since v48: **v49** `memory_relations.mention_count`, **v58** `memory_facts.expires_at` (fact ephemerality), **v61** `memory_facts.note_doc_id` + `document_chunks_fts` (notes/reference store), **v62** `document_versions`, **v63** `document_full_text`. (v50-v57, v59-v60, v64-v66 are scheduler / messaging / code-projects / MCP — out of scope here.)
 
 Convention notes:
 - All `created_at` / `last_accessed` / `first_seen` / `last_seen` / `valid_from` / `valid_to` / `linked_at` / `proposed_at` columns are **`INTEGER` Unix epoch seconds**, not SQL `TIMESTAMP`. Defaults are `(strftime('%s','now'))` for "set on insert" columns and literal constants (`0` / `NULL`) for columns added via post-v33 migrations (literal-constant defaults take SQLite's O(1) metadata-only ALTER path — no full-table rewrite under the auth_db lock at startup).
@@ -600,9 +600,12 @@ CREATE TABLE memory_facts (
     source_msg_id_start    INTEGER DEFAULT NULL,
     source_msg_id_end      INTEGER DEFAULT NULL,
     subject_entity_id      INTEGER DEFAULT NULL,  -- v47 — hard FK to subject entity
+    expires_at             INTEGER DEFAULT NULL,  -- v58 — fact ephemerality; NULL = durable, else hidden once now >= expires_at
+    note_doc_id            INTEGER DEFAULT NULL,  -- v61 — memory→note bridge: gloss fact → canonical note (documents.id)
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (superseded_by) REFERENCES memory_facts(id) ON DELETE SET NULL,
-    FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id) ON DELETE SET NULL
+    FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (note_doc_id) REFERENCES documents(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_memory_facts_user           ON memory_facts(user_id);
@@ -614,6 +617,10 @@ CREATE INDEX idx_memory_facts_subject        ON memory_facts(subject_entity_id)
 ```
 
 **`subject_entity_id` (v47)** is the Phase 0 extraction-prompt redesign's structural link from fact → entity. The redesigned prompt (May 2026) requires every fact to declare its subject (precedence ladder: `real_name` → named entity → descriptor → `"User"`); the parser resolves the subject string to an entity row before insert and stores the resulting FK here. Pre-v47 facts get backfilled from their linked relations at migration time (`UPDATE memory_facts SET subject_entity_id = (SELECT MIN(r.subject_entity_id) FROM memory_relations r WHERE r.fact_id = id AND r.subject_entity_id IS NOT NULL) WHERE subject_entity_id IS NULL`). Currently NULLABLE; planned to tighten to `NOT NULL` once production telemetry confirms the post-Phase-0 NULL rate stays near zero. The hard FK eliminated the legacy fact↔relation text-matching code (`find_fact_for_relation` retired) and lifted Phase 1A entity-graph retrieval (see §9.1.1) from a side path to the default search posture.
+
+**`expires_at` (v58)** adds fact ephemerality. NULL = durable (the default). When set, a non-mutating retrieval guard hides the fact once `now >= expires_at`, and the nightly maintenance job hard-prunes it after a grace window. Distinct from `memory_relations.valid_to` (which bounds a relation's validity interval, not a fact's lifetime).
+
+**`note_doc_id` (v61)** is the memory→note bridge pointer (FK to `documents(id)`, `ON DELETE SET NULL`). When set, the fact is a thin "gloss" breadcrumb — its `fact_text` is a self-directing directive ("…titled 'X', retrieve verbatim with document_read") — while the canonical note text lives only in the notes/reference store (`documents` + `document_chunks_fts`, see §6.10). A semantic hit on the gloss resolves to the verbatim note via this id. Gloss facts stay in the embedding cache (retrievable) but are exempt from paraphrase-dedup, find-duplicates, prune, decay, and pattern-delete. See `memory_note_bridge.c` / `memory_note_guard.c` (§12).
 
 #### 6.1.1 Fact category taxonomy (v34)
 
@@ -777,6 +784,7 @@ CREATE TABLE memory_relations (
     source_conversation_id INTEGER DEFAULT NULL,  -- v42 — Phase B provenance
     source_msg_id_start    INTEGER DEFAULT NULL,
     source_msg_id_end      INTEGER DEFAULT NULL,
+    mention_count INTEGER NOT NULL DEFAULT 1,     -- v49 — re-witness counter; bumped on open-relation upsert
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (subject_entity_id) REFERENCES memory_entities(id) ON DELETE CASCADE,
     FOREIGN KEY (object_entity_id) REFERENCES memory_entities(id) ON DELETE SET NULL,
@@ -789,9 +797,12 @@ CREATE INDEX idx_memory_relations_user          ON memory_relations(user_id);
 CREATE INDEX idx_memory_relations_user_validity ON memory_relations(user_id, valid_to);
 CREATE INDEX idx_memory_relations_subject_open  ON memory_relations(subject_entity_id, relation)
    WHERE valid_to IS NULL;
+CREATE UNIQUE INDEX idx_memory_relations_unique_open ON memory_relations(   -- v49
+   user_id, subject_entity_id, relation, COALESCE(object_entity_id, 0), COALESCE(object_value, ''))
+   WHERE valid_to IS NULL;
 ```
 
-The partial `idx_memory_relations_subject_open` index keeps the auto-close path (`memory_db_relation_supersede` — see §11 / S8) cheap: only currently-open relations are indexed.
+The partial `idx_memory_relations_subject_open` index keeps the auto-close path (`memory_db_relation_supersede` — see §11 / S8) cheap: only currently-open relations are indexed. **`mention_count` (v49)** turns repeated witnessing of the same open relation into a counter bump rather than a duplicate row: the `idx_memory_relations_unique_open` unique index defines "same open relation," and the upsert increments `mention_count` instead of inserting.
 
 ### 6.6 Conversations (anchor for cat-2 temporal extraction)
 
@@ -931,6 +942,44 @@ CREATE VIRTUAL TABLE memory_facts_fts USING fts5(
 **Querying**: BM25 is the first-pass keyword scorer when `[memory] bm25_enabled = true`. Raw `bm25()` scores are normalized to `[0,1]` via a query-length-adaptive sigmoid in `memory_bm25.c` (midpoint + steepness selected from five tiers — short / medium / long / very-long / extreme — adapted from Mem0's `mem0/utils/scoring.py::get_bm25_params` under Apache-2.0; see `NOTICE`). The normalized score blends with the existing semantic-cosine path in the hybrid composite.
 
 See §9.1.1 Search Strategy below for the path through the search dispatcher.
+
+### 6.12 Notes / reference-text store (v61–v63, memory-adjacent)
+
+The notes/reference store (June 2026) layers three tables on the shared `documents` infrastructure (§6.10). They are not memory tables, but the memory→note bridge (`memory_facts.note_doc_id`, §6.1) reaches into them, so they're documented here.
+
+```sql
+-- v61: contentless FTS5 over document chunks; the lexical channel + exact-label
+-- path that makes single-chunk "notes" reliably retrievable. Two weighted cols.
+CREATE VIRTUAL TABLE document_chunks_fts USING fts5(
+    label_stems, body_stems,               -- pre-stemmed (Porter2)
+    content='',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- v62: soft-archive of a doc/note's content captured before every destructive
+-- mutation (overwrite/edit/append/delete) for undo within a retention window.
+-- Deliberately NO FK to documents(id) so a version outlives a deleted note.
+CREATE TABLE document_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL,          -- intentionally NOT a FK
+    user_id INTEGER NOT NULL,
+    filename TEXT,
+    text TEXT,
+    archived_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_doc_versions_doc ON document_versions(document_id, archived_at DESC);
+
+-- v63: canonical un-chunked text of a multi-chunk document, so surgical
+-- find/replace edits can re-chunk + re-embed. Single-chunk notes don't use it.
+CREATE TABLE document_full_text (
+    document_id INTEGER PRIMARY KEY,
+    text TEXT,
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+```
+
+Unlike `memory_facts_fts` (single `fact_stems` column), `document_chunks_fts` carries two weighted columns (`label_stems` + `body_stems`) so an exact label match outranks a body match — the property that makes filed reference text retrieve rank-1. See `atlas/dawn/archive/NOTES_REFERENCE_STORE_DESIGN.md` for the full design.
 
 ---
 
@@ -1180,7 +1229,7 @@ Handles questions like:
   "as_of": "2020-06-01", "include_historical": "true" }
 ```
 
-**Parameters** (parsed in `src/memory/memory_callback.c:1044` `memoryCallback("search")` and forwarded to `memory_action_search`):
+**Parameters** (parsed in `src/memory/memory_callback.c` `memoryCallback("search")` and forwarded to `memory_action_search` — defined ~`memory_callback.c:530`; the dispatcher switch is at ~`:1988`. The full action set is 11: `search`, `remember`, `forget`, `get`, `find_duplicates`, `recent`, `save_contact`, `find_contact`, `list_contacts`, `delete_contact`, `merge_entities`):
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -2034,7 +2083,8 @@ include/memory/
 ├── memory_extraction.h          # Sleep-consolidation extraction entry points
 ├── memory_fact_search.h         # Hybrid-search public surface (extracted from memory_embeddings.c)
 ├── memory_focus_adapters.h      # Per-turn focus block: facts/entities/relations/summaries/chunks/calendar
-├── memory_filter.h              # Injection-pattern blocklist (~118 patterns + Unicode normalize)
+├── memory_note_bridge.h         # memory→note bridge: gloss facts resolve to canonical notes (v61)
+├── memory_note_guard.h          # extraction guard — keeps filed note bodies out of semantic memory
 ├── memory_context.h             # Session-start context builder (legacy ~800-tok block)
 ├── memory_history_loader.h      # Shared message-history loader for recovery + summarize-missing
 ├── memory_maintenance.h         # Nightly decay orchestration API
@@ -2053,6 +2103,7 @@ include/memory/
 
 include/core/
 ├── embedding_engine.h           # Shared embedding API (ONNX, Ollama, OpenAI providers)
+├── memory_filter.h              # Injection-pattern blocklist (~118 patterns + Unicode normalize)
 ├── time_query_parser.h          # Recognizes temporal expressions in queries (moved from src/tools)
 ├── iso8601.h                    # Canonical ISO 8601 parsing (consolidated April 2026)
 ├── strbuf.h                     # Growable string buffer used for memory tool output
@@ -2116,15 +2167,17 @@ src/memory/
 ├── memory_history_loader.c      # Shared image-strip + history-load for recovery + summarize-missing
   # ── Misc ────────────────────────────────────────────────────────────────────
 ├── memory_context.c             # Session-start context builder
-├── memory_callback.c            # LLM tool callback dispatcher (search / remember / forget /
-│                                #   recent + 4 contact actions + merge_entities → alias_link)
-├── memory_filter.c              # Injection-pattern blocklist + Unicode normalization
+├── memory_callback.c            # LLM tool callback dispatcher (search / remember / forget / get /
+│                                #   find_duplicates / recent + 4 contact actions + merge_entities)
+├── memory_note_bridge.c         # memory→note bridge: gloss upsert/delete + note_doc_id resolve (v61)
+├── memory_note_guard.c          # extraction guard — redacts filed note bodies from extraction input
 ├── memory_similarity.c          # Duplicate detection (Jaccard, FNV-1a hashing)
 ├── memory_maintenance.c         # Nightly decay orchestration
 └── contacts_db.c                # Contact CRUD (find, add, update, delete, list)
 
 src/core/
 ├── embedding_engine.c           # Provider-agnostic embedding + vector math
+├── memory_filter.c              # Injection-pattern blocklist + Unicode normalization
 ├── time_query_parser.c          # Layer 1 temporal-expression recognizer
 ├── iso8601.c                    # Canonical ISO 8601 parsing
 ├── strbuf.c                     # Growable string buffer (256 KiB cap, sticky-OOM)
