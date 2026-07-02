@@ -146,11 +146,13 @@ Statements are prepared per-call (write = 1 insert / 15 min, query = human caden
 Config-bearing `tool_metadata_t`. Capabilities `TOOL_CAP_SCHEDULABLE | TOOL_CAP_INFORMATIONAL`, `is_getter=true`, **no `TOOL_CAP_NETWORK`** (reads a local cache/DB). `INFORMATIONAL` means a scheduled "battery check" auto-promotes into a Friday-summarized briefing, like weather.
 
 Params:
-- `action` (enum, required): `all` (full status report) · `temps` · `battery` · `performance` (live, from cache) · `history` · `trend` (from stat.db). **Note:** `trend` is currently an alias of `history` — both emit the same min/max/avg aggregate (`stat_tool.c` routes them to the same branch). A true per-bucket trend *series* is not yet implemented (§12).
-- `period` (optional): `"last hour"`, `"overnight"`, `"today"`, `"24h"`, `"7d"` — a purpose-built duration-window parser (not `time_query_parser`, which is point/midpoint-oriented for retrieval scoring, not duration windows).
-- `metric` (optional): narrow history to `temperature`/`battery`/`cpu`/`memory`/`fan`.
+- `action` (enum, required): `all` (full status report) · `temps` · `battery` · `performance` (live, from cache) · `history` (SQL-aggregate prose) · `trend` (a chartable per-interval time **series**, from stat.db).
+- `period` (optional): `"last hour"`, `"overnight"`, `"today"`, `"24h"`, `"7d"` — a purpose-built duration-window parser (not `time_query_parser`, which is point/midpoint-oriented for retrieval scoring, not duration windows). `history` defaults to the last hour; `trend` defaults to the last 24h (a rich chart, not a ~4-point one).
+- `metric` (optional): `history` reports `temperature`/`battery`/`cpu`/`memory`/`fan` (defaults to temperature + battery). `trend` charts one metric (default temperature) and additionally supports `power` (W) and `voltage` (V) — those two are **trend-only** (their columns are stored but `stat_history_agg_t`/`format_history` don't carry them, so the param description scopes them to `trend` rather than silently returning an empty `history` report).
 
-**Bounded output:** `history` (and its `trend` alias) aggregates **in SQL** (`MIN`/`MAX`/sample-weighted-`AVG` + peak-bucket lookup) → a fixed-size result regardless of window, so a 7-day window can't blow up the LLM-facing string. (If a true per-bucket `trend` series is added later, it must cap the emitted point count — see §12.)
+**`history` — bounded aggregate.** Aggregates **in SQL** (`MIN`/`MAX`/sample-weighted-`AVG` + peak-bucket lookup) → a fixed-size result regardless of window, so a 7-day window can't blow up the LLM-facing string.
+
+**`trend` — chartable series (shipped, un-aliased from `history`).** `stat_db_series()` groups buckets so the result never exceeds `STAT_SERIES_MAX_POINTS` (48; longer windows downsampled with an integer-exact `ceil(span/48)` bucket-aligned group width). Per group: sample-weighted avg + exact MIN(min)/MAX(max) *where the metric stores those columns* (three shapes — temp/battery: min/avg/max; cpu/mem/fan: avg/max; power/voltage: avg-only). A group with no samples for the metric's family is emitted as a **gap** (`have_avg=false` → JSON `null`), never a spurious 0 (the `SQLITE_NULL` check). Range is inclusive `BETWEEN` (matches `history` + the memory `recent` convention); the boundary group an aligned `end` can add is absorbed by a `+1` array slot and a capped read loop. `stat_tool` formats the series as copy-exact Chart.js-ready JSON fragments (`"labels"`/`"avg"`/`"min"`/`"max"`, pre-rounded, span-aware labels) with a voice-friendly prose header + an affordance line steering the LLM to render a **line chart via `render_visual`** — the LLM-orchestrated `trend → render_visual_load_guidelines → render_visual` flow. `tool_instructions/render_visual/chart.md` carries a worked min–max-band line-chart example using those exact keys.
 
 Config `[stat]` (in `dawn.toml`): `enabled`, `telemetry_topic`, `status_topic`, `db_path` (default `/var/lib/dawn/stat.db`), `stale_after_sec`, `history_retention_days`. Tool-owned config, like `phone`/`weather`/`home_assistant` — deliberately *not* in the WebUI `SETTINGS_SCHEMA` (which maps only to the global config struct); a dedicated admin panel is the correct future UI surface.
 
@@ -209,10 +211,10 @@ Compile-time gated. To remove: revert the four wiring edits (`DawnTools.cmake` b
 
 ---
 
-## §12. Future work (not shipped)
+## §12. Future work
 
+- **~~True `trend` series~~ — SHIPPED (follow-on to the initial ship).** `trend` is now a real chartable per-interval series (`stat_db_series()` + copy-exact JSON output + render_visual chaining), un-aliased from `history`; power/voltage added as chartable metrics. See the tool section above. Unit-tested (grouping cap, integer-ceiling, aligned-end no-overrun, NULL-gap-not-zero, avg-only metrics). Remaining series follow-ups: a live high-resolution ring buffer (today only 15-min DB buckets exist, so "last hour" is a coarse ~4-point chart), and an optional multi-metric single-call overlay.
 - **Proactive telemetry alerts** — a background threshold-watch (battery/temp) that fires via the scheduler/notification path so Friday warns *without being asked*. The natural Phase 2; the live cache here is what it would poll.
-- **Per-rail power** — a `power` action over STAT's `SystemPower`/INA3221 for "what's drawing the most?".
-- **True `trend` series** — `trend` currently aliases `history` (a single min/max/avg + peak aggregate); the tool/param descriptions were aligned to say exactly that (doc-accuracy review, 2026-07-02). Optional future work: implement a bucketed, point-capped time series for `trend` distinct from `history`'s single aggregate.
+- **Per-rail power** — a per-rail breakdown over STAT's `SystemPower`/INA3221 for "what's drawing the most?" (distinct from the aggregate `power` metric now chartable via `trend`).
 - **Finer history granularity** — the 15-min bucket is the maintenance-interval piggyback; a config'd finer cadence (own timer) if telemetry ever needs sub-15-min resolution.
 - **Tool-registry deep-copy** (tracked in `docs/TODO.md`) — the registry shallow-copies metadata (retains the caller's `.rodata` pointers), a blocker for the future loadable-`.so` tool modules. The `tool_effective_description` registry-read path (§9) is aligned with, and rides on, that eventual change.
