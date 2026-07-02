@@ -103,6 +103,7 @@ Memory has its own subdirectory at [`dawn/memory/`](dawn/memory/) — see the [m
 | [EMAIL_DESIGN](dawn/archive/EMAIL_DESIGN.md) | Email integration (IMAP/SMTP, Gmail REST API, multi-account, 10 LLM actions) |
 | [TWO_STEP_TOOL_PATTERN](dawn/archive/TWO_STEP_TOOL_PATTERN.md) | Two-step tool pattern: load guidelines then execute (used by render_visual) |
 | [VISUAL_RENDERING_TOOL](dawn/archive/VISUAL_RENDERING_TOOL.md) | Visual rendering tool: inline SVG/HTML diagrams via LLM tool calling, progress indicator investigation |
+| [STAT_TELEMETRY_DESIGN](dawn/archive/STAT_TELEMETRY_DESIGN.md) | System telemetry (`system_status` tool): ingest the STAT sensor daemon's MQTT feed into a mutex-guarded live cache (leaf service in `src/core/`) + downsampled history in a self-contained `stat.db`; answers live + historical temperature/battery/load/fan. Compile-time gated; untrusted-MQTT hardened. Includes the companion tool-description truncation fix (registry-read + MCP UTF-8 sanitize) and the system-prompt tools-schema debug surface. |
 
 ### Coding Harness (Code Projects + MCP Bridge)
 
