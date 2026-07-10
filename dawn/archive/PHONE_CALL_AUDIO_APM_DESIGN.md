@@ -105,10 +105,23 @@ AEC/WebRTC is opt-in (`ENABLE_AEC`), and both the wake-word AEC **and** the phon
 
 ---
 
-## 9. Deferred (documented, not dropped)
+## 9. Latency hardening + deferred
 
-- **eff-M1 downlink discard-drain** — bounds downlink latency if the tty buffer backlogs. Kept a separate follow-up so it doesn't perturb the balance invariant the staging change relies on (bisectability); never fired live (`up_short=0`).
-- **Reconfigure observable-effect test** — asserting an `output_rms_dbfs` delta after a fixed-gain change needs an AEC-on integration harness; live-verifiable meanwhile via the bridge's ~1 s `output_rms_dbfs` log.
+**eff-M1 downlink backlog drain (shipped as a follow-up).** The balanced read
+consumes exactly one cycle of downlink, so a scheduling stall that backs up the
+modem's tty buffer would become permanent added mouth-to-ear latency.
+`downlink_drain_backlog()` (phone_audio_bridge.c) checks `FIONREAD` after each
+cycle's play and, when the backlog exceeds ~60 ms, discards the oldest bytes down
+to ~20 ms (hysteresis), bounded to ~160 ms/cycle and terminating at `EAGAIN`.  It
+reuses the play path's exact `dn_carry` byte accounting, so 16-bit framing stays
+aligned regardless of drop size or odd `read()` returns; it drains downlink only,
+so the uplink balance is untouched.  Landed separately from the staging change so
+a balance regression would stay bisectable (it never fired live before).
+
+**Still deferred:** the reconfigure observable-effect test — asserting a level
+(dBFS) delta after a fixed-gain change needs an AEC-on integration harness;
+live-verifiable meanwhile via the bridge's ~1 s level trace (uplink/downlink RMS
+in dBFS, computed directly from the emitted/played PCM — 0 = full scale).
 
 ---
 
