@@ -34,6 +34,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [AEC_DELAY_CALIBRATION](dawn/archive/AEC_DELAY_CALIBRATION.md) | Auto-calibrate AEC delay using TTS boot greeting |
 | [AEC_IMPLEMENTATION_STATUS](dawn/archive/AEC_IMPLEMENTATION_STATUS.md) | Native 48kHz AEC with WebRTC AEC3 — working state |
 | [AEC_IMPLEMENTATION_GUIDE](dawn/archive/AEC_IMPLEMENTATION_GUIDE.md) | WebRTC AEC3 setup, resampling strategy, tuning parameters |
+| [PHONE_CALL_AUDIO_APM_DESIGN](dawn/archive/PHONE_CALL_AUDIO_APM_DESIGN.md) | Phone call audio: dedicated WebRTC APM instances (uplink + downlink AGC2/NS/HPF, AECM), mid-call live tuning, WebUI settings + [phone] config clobber fix, AEC preset/graceful-degradation build changes |
 
 ### LLM Integration
 
