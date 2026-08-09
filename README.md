@@ -35,6 +35,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [AEC_IMPLEMENTATION_STATUS](dawn/archive/AEC_IMPLEMENTATION_STATUS.md) | Native 48kHz AEC with WebRTC AEC3 — working state |
 | [AEC_IMPLEMENTATION_GUIDE](dawn/archive/AEC_IMPLEMENTATION_GUIDE.md) | WebRTC AEC3 setup, resampling strategy, tuning parameters |
 | [PHONE_CALL_AUDIO_APM_DESIGN](dawn/archive/PHONE_CALL_AUDIO_APM_DESIGN.md) | Phone call audio: dedicated WebRTC APM instances (uplink + downlink AGC2/NS/HPF, AECM), mid-call live tuning, WebUI settings + [phone] config clobber fix, AEC preset/graceful-degradation build changes |
+| [MUSIC_STREAMING_DESIGN](dawn/archive/MUSIC_STREAMING_DESIGN.md) | Music streaming over a dedicated flow-controlled WebSocket for all clients: server-side closed-loop pacing (client buffer reports, ~2s lead, gapless auto-advance), browser off-main-thread WebCodecs decode (Worker → MessagePort → AudioWorklet), satellite flow-control parity, the music_state teardown UAF fix, TTS resampler SINC_MEDIUM, and the OTA ssl_verify fix (PR #26) |
 
 ### LLM Integration
 
