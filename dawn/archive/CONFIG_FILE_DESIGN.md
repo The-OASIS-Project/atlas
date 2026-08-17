@@ -795,6 +795,18 @@ require implementing new adapter code in `src/tools/web_search.c`. Each engine h
 APIs, authentication requirements, and rate limits. This is a feature addition beyond config
 wiring scope.
 
+> **UPDATE (2026-08-17):** The two paragraphs above are historical and now stale. **Tavily** shipped
+> as a second, fully-implemented search backend — `search.engine` is honored (`"searxng"` |
+> `"tavily"` | `"disabled"`), Tavily also serves as a URL-fetch fallback (`[url_fetcher] fallback`),
+> and `web_search_tavily.c` is the adapter. A 2026-08-17 deep-research benchmark (Sonnet 5, gpt-5.5
+> RACE / gpt-5.4-mini FACT, SearXNG **2026.8.17**) put Tavily modestly ahead on report quality
+> (RACE 0.499 vs 0.482, ~3%) and source breadth/consistency, with SearXNG faster per query and *more*
+> citation-accurate (FACT 0.882 vs 0.795). Recommended deployment is Tavily-primary + tuned-SearXNG
+> fallback. Two operational fixes came out of that run: SearXNG's default ~3s `outgoing.request_timeout`
+> starves the major engines (fix in GETTING_STARTED.md's `settings.yml` template), and a
+> network-failed research run was mis-disposed as `saturation`/`done` (fixed in `research_run_loop.c`).
+> Full writeup: `docs/DEEP_RESEARCH_DESIGN.md` §18 and `GETTING_STARTED.md` § Tavily.
+
 ### Notes
 
 - Settings marked "CLI override pattern" respect command-line args as highest priority
