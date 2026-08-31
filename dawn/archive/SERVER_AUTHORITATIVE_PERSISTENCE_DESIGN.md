@@ -694,3 +694,97 @@ stream_id threading, R2 emitter-stamp table §6e, R3 promise-break in Phase 1 at
 - **Addressing-model lift (architecture, deferred):** `stream_id`/`conversation_id` on `message_appended`
   are envelope/routing metadata — write the correlation liftable, migrate to the envelope when the tracked
   addressing-model refactor lands.
+
+## 14. Living tool pills — the UI layer on the tool-step fan (commits `4251228` → `cdc1574` → `6493223`, + `iter` marker `b570f31`; Aurora `9a3a2eb`/`4a69844`, 2026-08-29/30)
+
+The §12h `tool_step` fan carries tool activity; this renders it as compact, always-visible **pills** inline in
+the transcript, replacing the old hidden `.transcript-entry.debug` rows. One pill per tool invocation; a group
+per tool-loop iteration (collapses to a summary at ≥3). New `www/js/ui/tool-pills.js` (`DawnToolPills`).
+
+- **Correlation key = `tool_call_id`** — the SAME key `load_conversation` emits on the `tool_calls`/`role:tool`
+  rows, so a client pairs a result to its call with ONE implementation across live and reload. It rides INSIDE
+  the opaque `tool_step` payload (not an outer field), byte-identical to the reload key.
+- **Three render paths, all keyed on `tool_call_id`:** LIVE origin, LIVE bystander (via the §12h cross-viewer
+  fan), and RELOAD (`renderReloadGroup`, once per assistant `tool_calls` message).
+- **`tool_step_origin` capability** (per-connection handshake bool, sibling to `tts_enabled`): when set, the
+  server includes the ORIGIN's own connection in the `tool_step` fan, so the origin renders its own pills from
+  the SAME path as a bystander (no stream-derived path). Default off preserves §12h origin-exclusion; stock
+  www + Aurora both advertise it. **Live bug found:** the flag was parsed only in `webui_server.c`, but the
+  LIVE reconnect/init runs through `webui_message_dispatch.c` — so origin pills never armed until `cdc1574`
+  added the parse to all three live handshake sites. (Lesson: grep the log for which handshake handler is live
+  before adding a capability parse.)
+- **Per-iteration `iter` grouping marker (`b570f31`):** live grouping originally sealed on `stream_start`
+  boundaries — but a BYSTANDER watching another session's turn gets `tool_step` frames and NOT `stream_start`
+  (§ "3c" narration isn't fanned live), so before this it had ZERO live sealing signal and every iteration's
+  pills piled into one group until reload. The daemon now stamps `iter` (int, 0-based per tool-loop iteration)
+  on both `tool_call`+`tool_result` payloads; the client seals its group when `iter` DIFFERS from last-seen
+  (keyed on "differs" so a per-turn reset …3→0 also seals), complementary to the `stream_start` seal (both
+  idempotent). Absent `iter` → `stream_start` seal only (back-compat both directions). **The 1:1 invariant
+  that makes live == reload:** `persist_appended_tool_turn` runs exactly once per iteration and
+  `append_*_tool_history` collapses to exactly ONE assistant `tool_calls` row per iteration; the
+  duplicate-forced-final / max-iter paths return without emitting a `tool_step`. So per-`iter` live grouping
+  matches per-message reload grouping. A bystander last-group seal was also added in `handleMessageAppended`
+  (the final answer is the turn-end seal, since a bystander never gets `finalizeStream`).
+- **Untrusted content** (tool name/args/result) is ALWAYS set via `textContent`, never innerHTML; detail
+  capped 4096B, keyboard-scrollable.
+- **Design (live iteration with the developer):** neutral pill surface (`--tool-subtle`/`--tool-hover`/
+  `--tool-border`), tool NAME + state rail tinted by the **theme accent** (`--dawn-toolpill-name: var(--accent)`
+  recolours per theme). A pre-existing `.tool-pill` in `visualizer.css` forced a rename of the whole family to
+  `.dawn-toolpill*`/`.dawn-toolgroup*` (found via live DOM inspection).
+- Both clients lockstep to the frozen contract (Aurora `9a3a2eb` pills, `4a69844` iter). Reviewed
+  security+correctness+arch/ui (0 crit/high); live-verified origin + bystander + reload.
+
+## 15. Red-on-failure signal — the parked tool-status idea, reshaped (commits `c7a7ee5` live → `8d662d1` reload-persist/v81 → `971f157` HA+url_fetch → `acf2e43` 25-tool fan-out → memory_callback → phone/music; Aurora `9a3a2eb` live + `28a5c51` reload, 2026-08-30/31)
+
+The pills settled on a NEUTRAL "done" state because the daemon sent no per-tool status. This adds one — but
+as **RED-ONLY**, the developer's call: a pill reds only on a CONFIRMED failure; success AND unknown stay
+neutral. Rationale — **fails safe** (a missed failure degrades to neutral; a red is never inferred from
+result content, so attacker-influenced tool output can't force one), less visual noise (colour marks only the
+exception), and a simpler contract than green/red.
+
+- **The verdict is computed at execute time, never parsed from text.** `tool_result_t` gains `is_error`
+  (`llm_tools.c`), set as `!success` (structural: bad args, no callback, command failure) **OR** the tool's own
+  `TOOL_RESULT_ERROR_MARK` (`"\x01"`, a semantic hard-failure prefix the tool self-sets — captured BEFORE the
+  strip at the direct-callback dispatch site). This is the security-critical property: `error` derives only
+  from a status bool + a first-byte check on the tool's OWN return, so the wire flag can't be forged by tool
+  output. Correctness-reviewed for false-reds and mark placement (0 crit/high/med).
+- **Live signal:** optional `"error": true` on the `tool_result` `tool_step` payload (OMITTED otherwise —
+  neutral = success or unknown), threaded via a `tcid → is_error` side-map in `persist_appended_tool_turn`
+  (built whenever the turn persists OR fans, so persist gets the verdict even with no live viewer). Canonical
+  history is deliberately NOT annotated — an unknown key on a `role:tool` row 500s strict local Jinja.
+- **Reload parity — persisted, schema v81:** a `messages.is_error` column (base CREATE + idempotent
+  `ALTER TABLE` migration, `DEFAULT 0` so every existing/non-tool row is neutral). `conv_db_add_message_with_tools`
+  became a `false`-passing wrapper over a new `_ex` variant carrying `is_error`; the tool-persist hook
+  (`session_tool_persist_fn` + both impls) carries the flag; `load_conversation` emits it on tool rows. **Key-name
+  split (documented at both daemon sites):** the LIVE frame key is `error`, the RELOAD projection key is
+  `is_error` (the DB column) — deliberate twins, one concept, two message types.
+- **The load-bearing lesson: the plumbing is inert without tools MARKING their failures.** Only 5 tools set the
+  mark initially; the first live test (HA "entity not found", url_fetch "network error") showed NEUTRAL because
+  those tools returned failure as **plain text with `success=true`**. So the real feature is marker COVERAGE.
+  The convention is documented in `TOOL_DEVELOPMENT_GUIDE.md` § "Signaling a Failure" (mark ONLY hard failures;
+  NOT valid-empty results, success, or input-guidance — a false red misleads, a missed red is safe). Adoption
+  fanned out across ~30 tools (5 parallel sub-agents), then a false-red correctness pass: mark placement is
+  always first-byte, shared error helpers (`email_rc_to_error`, `dispatch_error`, HA `make_error_msg`, calendar
+  finalize, scheduler/document_manage parse helpers) mark ONLY failure paths, and empty-results + success +
+  job/run STATUS reports stay neutral. The "missing-required-field / requires-X" class was a deliberate policy
+  call — kept marked (ship-as-is).
+- **Service-layer tools (phone/music):** phone's `phone_service_*` results are opaque pass-throughs, so the mark
+  is keyed on the service's documented `0/1` return code via a helper (`phone_service_result_dup`) — never
+  parsed from the message text; the multi-contact disambiguation shares the error code and reds too (accepted).
+  music is all local literals.
+- Both clients: live `error` + reload `is_error` → red pill + red collapsed-group summary. Aurora shipped the
+  same contract (`9a3a2eb` live, `28a5c51` reload). Backfill note: existing pre-v81 rows read neutral on
+  reload (no backfill); known failures can be flagged with a one-shot `UPDATE messages SET is_error=1`.
+
+## 16. Hard-refresh blank-transcript fix (commit `c28f042`, 2026-08-29/30)
+
+Surfaced while testing the pills. After a **hard browser refresh** the WebUI came up with an EMPTY transcript
+though the sidebar showed the last conversation selected; re-clicking loaded it. Root cause: a hard refresh
+wipes the JS/DOM but the WS drop is brief enough that the **server session survives**, so the reconnect replies
+`reconnected:true` and the client took the **re-anchor-only** path (`set_active_conversation`, no reload) whose
+"display already current" assumption holds for a transient socket drop but is false after a page reload. The
+server can't distinguish a DOM-preserving socket reconnect from a page reload (same surviving session), so the
+fix is client-side: a **page-load-lifetime latch** `transcriptRestoredSincePageLoad` (init false, NOT reset per
+socket — a hard refresh = fresh JS context = false again; a transient reconnect keeps it true) added as a third
+sufficient trigger for the full `load_conversation` on the first restore after any page load. `load_conversation`
+also sets `active_conversation_id` server-side, so it subsumes the re-anchor — no anchor lost. Client-only.
