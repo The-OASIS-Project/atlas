@@ -626,7 +626,7 @@ double-render.
   live (bystander live view is a subset of reload — symmetric on both clients; closing it = the
   `ws_response_t` addressing-model refactor). Post-execution emit → call+result arrive batched.
 
-## 12i. Phase-4 — multi-target TTS (#4, 2026-08-28, live-verified; commit pending)
+## 12i. Phase-4 — multi-target TTS (#4, commit `5ef9779`, 2026-08-28, live-verified)
 
 Closes §12b item 4: a text- or voice-originated turn's synthesized speech now plays on every TTS-enabled
 **WEBUI browser** viewing the conversation (the origin included iff its own TTS is on), not just the origin.

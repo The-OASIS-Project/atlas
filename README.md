@@ -2,7 +2,7 @@
 
 Advanced Technical Library and Archival System
 
-Historical design documentation for [The OASIS Project](https://github.com/The-OASIS-Project). These documents capture architectural decisions, completed feature designs, and implementation records that shaped the project. They are preserved here for reference after being retired from active repositories.
+The technical library for [The OASIS Project](https://github.com/The-OASIS-Project): a home for material that supports the project but lives better outside the active code repositories. It spans **design documentation** — architectural decisions, feature designs, and implementation records, some retired from the active repos, some recently implemented, some maintained as the code evolves — and reusable, **project-agnostic tooling**. Not strictly an archive: content ranges from historical records to living references.
 
 ## DAWN Archive
 
@@ -112,3 +112,19 @@ Memory has its own subdirectory at [`dawn/memory/`](dawn/memory/) — see the [m
 | Document | Description |
 |----------|-------------|
 | [CODING_HARNESS_DESIGN](dawn/archive/CODING_HARNESS_DESIGN.md) | Code-projects subsystem: HTTP+SSE **MCP bridge** to an operator-launched cbm (`codebase-memory-mcp`) code-graph server, in-process **libgit2** clone/fetch/checkout, per-project name-translation boundary, WebUI Coding popover + dawn-admin CLI. Phase 1 (clone-and-index) + Phase 2 (branch tracking, link-local repos, refresh-vs-rebuild, multi-project namemap, cbm sharing with Claude Code). Default-OFF (`DAWN_ENABLE_CODE_PROJECTS`); no-subprocess invariant CI-enforced. Consolidates the Phase 1 plan, Phase 2 plan, and cbm-sharing note. |
+
+## Claude Code Agents
+
+Project-agnostic Claude Code review and planning subagents used across OASIS repos — and portable to any codebase. They derive project specifics (conventions, target platform, error scheme, attack surface) from the target repo's own docs at runtime, so the same agents review DAWN, ECHO, MIRAGE, or anything else without edits — put your conventions in the target repo's `CLAUDE.md`/style guide, not in the agents. Drop them in `~/.claude/agents/` (all projects) or a repo's `.claude/agents/`. This directory is the canonical copy. Full detail and per-agent setup knobs: [claude-agents/README.md](claude-agents/README.md). MIT-licensed.
+
+| Agent | Lens |
+|-------|------|
+| [architecture-reviewer](claude-agents/architecture-reviewer.md) | Macro structure, coupling, layering, threading model |
+| [correctness-reviewer](claude-agents/correctness-reviewer.md) | Logic bugs: state-ordering, boundaries, contract-vs-impl, invariants, error paths |
+| [security-auditor](claude-agents/security-auditor.md) | Memory corruption, injection, protocol/attack surface, crypto, privilege |
+| [embedded-efficiency-reviewer](claude-agents/embedded-efficiency-reviewer.md) | Resource/perf on embedded targets (Jetson/ESP32/RPi/x86 profiles) |
+| [coding-standards-auditor](claude-agents/coding-standards-auditor.md) | Compliance with the project's own documented style; phased remediation |
+| [reuse-pattern-reviewer](claude-agents/reuse-pattern-reviewer.md) | Extract-when-it-helps refactoring (not blind dedup) |
+| [master-code-reviewer](claude-agents/master-code-reviewer.md) | Polyglot all-in-one reviewer (memory/efficiency/scope/correctness/UI/security) |
+| [master-plan-reviewer](claude-agents/master-plan-reviewer.md) | Deep design/plan review: SOTA research, gap analysis, phased rollout |
+| [ui-design-architect](claude-agents/ui-design-architect.md) | UI/UX design + accessibility review (fires only when UI is present) |
