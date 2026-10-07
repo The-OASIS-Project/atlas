@@ -50,6 +50,7 @@ Design documents from the [DAWN](https://github.com/The-OASIS-Project/dawn) voic
 | [NATIVE_TOOLS_PLAN](dawn/archive/NATIVE_TOOLS_PLAN.md) | Native tool/function calling implementation |
 | [COMMAND_TAGS_DYNAMIC_GENERATION_PLAN](dawn/archive/COMMAND_TAGS_DYNAMIC_GENERATION_PLAN.md) | Dynamic command tag generation from tool registry |
 | [SUMMARIZER_TFIDF_PLAN](dawn/archive/SUMMARIZER_TFIDF_PLAN.md) | Summarizer fallback fix + TF-IDF extractive summarization |
+| [LCM_DESIGN](dawn/archive/LCM_DESIGN.md) | Lossless Context Management: three-level summarization escalation, summary nodes with `context_expand` drill-down, and the original in-loop compaction (superseded in part: compaction now happens only at a turn seam, see PROMPT_CACHE_DESIGN) |
 | [PROMPT_CACHE_DESIGN](dawn/archive/PROMPT_CACHE_DESIGN.md) | Prompt caching across Anthropic, OpenRouter, OpenAI, Gemini and llama.cpp: one append-only request per conversation (frozen prefix, appended turn context, tools frozen by value, compaction at the turn seam, reasoning replayed verbatim), thinking-binding controls, measured per-provider cache behavior, warm-miss detection and cache stats (P0–P4) |
 | [TOOL_RESULT_VIEWS_DESIGN](dawn/archive/TOOL_RESULT_VIEWS_DESIGN.md) | Large tool results: bounded structure-preserving views sized to the context window, the full result stored per conversation behind a handle, the `result_read` tool (read/path/grep/count/distinct), with prior art and a controlled A/B |
 
