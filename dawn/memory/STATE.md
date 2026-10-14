@@ -8,7 +8,7 @@ History lives in git and in `dawn/docs/DONE.md`; design detail lives in the docs
 context as the conversation moves, and never makes things up. Benchmarks serve that; they don't
 define it.
 
-**Last updated:** 2026-10-09.
+**Last updated:** 2026-10-14.
 
 ## Where it stands
 
@@ -16,6 +16,12 @@ LoCoMo `recall_generation`, leader-comparable: **0.7689** (2026-10-08), with Cla
 as `[memory] extraction_model` and `extraction_effort = "medium"` (the setting arrived in dawn
 PR #38). That is the recommended setup, not the shipped default: a fresh install extracts with a
 local `qwen2.5:7b`, effort off, which hasn't been benchmarked.
+
+On current code it measures lower: two fresh runs on 2026-10-14 scored 0.7552 and 0.7533
+(mean 0.754). The extraction prompt changed in between (dawn PR #49 keeps a second email, phone,
+job or home), and runs on the same code have spread up to 1.3pp, so whether the ~1pp gap is the
+prompt or run-to-run spread is still open (What's next). Retrieval didn't change it: the memory
+cleanup (dawn PR #54) gave byte-identical memory text on all 1,536 questions.
 
 Haiku 4.5 extraction scored 0.7279 on the same protocol. Per-effort scores, categories, cost
 and timing: dawn `benchmarks/README.md` § Claude Haiku 5.5 extraction.
@@ -67,7 +73,7 @@ Each was measured or researched and lost. Reopen only with evidence that changes
 | Idea | Why it's dead |
 |---|---|
 | Cross-encoder reranker as the main lever | OMEGA removed theirs and gained; best published gain is small. A dominant-token heuristic shipped instead ([RERANKER_INVESTIGATION.md](RERANKER_INVESTIGATION.md)). |
-| RRF parallel-channel retrieval | −3.7pp, then −0.58pp on re-test after BM25. Code stays behind `rrf_enabled` (off). |
+| RRF parallel-channel retrieval | −3.7pp, then −0.58pp on re-test after BM25. Code and `rrf_enabled` removed (dawn PR #54), with the LIKE keyword path, flat graph scoring and the verbose memory text that also lost. |
 | Mem0 scoring weights 0.40/0.60, over-fetch 40, spread-attenuated entity boost | −0.72pp, isolated to the weight shift; the boost duplicates the entity graph's 1-hop expansion. All reverted. |
 | Mem0 no-echo extraction rule | Cat-4 −2.4pp; DAWN's source excerpts already separate user from assistant. |
 | Side-mention completeness extraction rule | −0.78pp, cat-3 −6.5pp. |
@@ -81,6 +87,10 @@ Each was measured or researched and lost. Reopen only with evidence that changes
 
 Extraction recall is the open problem; the candidates (per-turn extraction, speaker
 attribution) and the rest of the memory backlog are in `dawn/docs/TODO.md`.
+
+Next is an evaluation of the extraction prompt itself: which of its rules still earn their
+tokens, judged on real conversations with LoCoMo as a guard. It should also settle whether the
+current prompt costs the ~1pp above.
 
 ## Keeping this current
 
