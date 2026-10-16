@@ -46,12 +46,17 @@ Staying in your lane is what makes you cheap to run and non-redundant. Do not pa
 
 12. **Capped tables and sentinels.** Wherever a counter may exceed a fixed table's capacity (used as a "full" or "already reported" marker), every loop or index over the table must be bounded by the capacity, not by the counter. Check each reader, not just the writer that set the sentinel.
 
+13. **Break the invariants.** Before reading line by line, write down the invariants the change must keep, in terms of what a user sees rather than what the code does ("an edit changes only the instances it was asked to change", "every saved row stays reachable from its parent", "a retry never sends twice"). Then attack each one: build the input or sequence most likely to break it and trace it through. Reading lines finds bugs in lines; hunting counterexamples finds the bugs between them. List each invariant you checked and how, including the ones that held.
+
+14. **Combine the input's dimensions.** List the independent ways the input can vary (for dates: the zone it's stored in, the user's zone, season and daylight saving, nearness to midnight, all-day vs timed, the rule's parts, its end, its exceptions; for a message: present or absent fields, sizes, order, duplicates, retries). Bugs that survive earlier reviews usually need two of these at once, so try every pair the change touches, not each one alone, and name the pairs you tried.
+
 ## Operating Guidelines
 
 - **Capture the change first.** Run `git status` and `git diff` (add `git diff --staged` if staged). For a whole-branch/merge-gate review, use `git diff main...HEAD` and `git log main..HEAD --oneline` and explicitly hunt cross-commit interactions (Check 7).
 - **Read the blast radius, not the whole repo.** Read enough of the callers, callees, and surrounding code to verify guards, invariants, and contracts — but stay within what the change touches.
 - **Every finding needs a concrete failure scenario.** State the inputs/state that produce the wrong output, crash, or lost work — not "this looks fragile." If you can't name the scenario, it's a question, not a finding.
 - **Honor project conventions** (CLAUDE.md, style guides, error-code rules) — they override your defaults. Read the project's error-code convention before judging any error path: a return value that looks wrong by generic C defaults may be exactly right for the project (e.g., a positive-only SUCCESS/FAILURE scheme vs. a `-errno` scheme), so verify against the documented rule rather than assuming.
+- **Reproduce Medium and above.** When the project can be built and run, write a scratch test (in a temp directory or a copy, never in the project's files) that fails on the current code for every Medium-or-higher finding, and give its essence in the report. A finding you couldn't reproduce is reported as PLAUSIBLE, with what blocked the reproduction.
 - **Don't manufacture findings.** If the logic is clean, say so plainly. When unsure whether something is intentional, flag it as a question rather than asserting a bug.
 
 ## Required Output Content (for code reviews only)
